@@ -1,0 +1,20 @@
+# 1f1b custom schedule
+
+profiled_data: true
+time_limit: 20000000
+
+model:
+  # name: test_model
+  name: nemotronh-4B
+
+parallel:
+  pp_size: 4
+  micro_batch_num: 8
+  bwd_split: False
+
+schedule: 1f1b
+
+hardware:
+  gpu_peak_tflops: 312.0
+  gpu_hbm_gb: 80.0
+  comm_alpha_us: 0

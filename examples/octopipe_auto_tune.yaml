@@ -1,0 +1,32 @@
+# OctoPipe with automatic partition/placement search (default when both are omitted).
+
+profiled_data: true
+time_limit: 20000000
+
+model:
+  # name: test_model
+  # name: nemotronh-4B
+  name: nemotronh-nano-v2-9B
+
+parallel:
+  pp_size: 4
+  micro_batch_num: 8
+  bwd_split: True
+  # chunk_num: 2   # optional: limit search to this virtual-pipeline depth
+
+schedule: octopipe
+
+tuning:
+  auto_tune: true   # default for octopipe when partition/placement omitted
+  sim_k: 32          # full simulations on top-k fast-est candidates
+  beam_width: 32    # random placement variants per chunk size
+  bubble_overlap_tune: true
+  bubble_overlap_max_iter: 4
+  bubble_overlap_group_by: mid_type  # mid | mid_type | mid_sid_type
+  partition_top_k: 32
+  result_top_k: 10
+
+hardware:
+  gpu_peak_tflops: 312.0
+  gpu_hbm_gb: 80.0
+  comm_alpha_us: 0

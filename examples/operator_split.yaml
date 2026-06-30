@@ -1,0 +1,14 @@
+model:
+  name: test-split
+  hidden_size: 512
+  num_layers: 4
+  num_attention_heads: 8
+  seq_len: 1024
+
+parallel:
+  pp_size: 2
+  micro_batch_num: 4
+
+schedule: 1f1b
+
+# Use operator-level partition via CLI/API; layer partition [2,2] is default

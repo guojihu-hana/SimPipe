@@ -1,0 +1,34 @@
+# Custom partition + placement for OctoPipe (48 layers, 4 GPUs, 8 stages).
+# Omit partition_layers / placement to auto-derive from schedule + chunk_num.
+
+profiled_data: true
+time_limit: 20000000
+
+model:
+  # name: test_model
+  name: nemotronh-4B
+
+parallel:
+  pp_size: 4
+  micro_batch_num: 8
+  bwd_split: True
+
+schedule: octopipe
+
+partition_layers: [13, 13, 13, 13]
+placement:
+  - [0]
+  - [1]
+  - [2]
+  - [3]
+
+tuning:
+  auto_tune: false
+  bubble_overlap_tune: true
+  bubble_overlap_max_iter: 4
+  bubble_overlap_group_by: mid_type  # mid | mid_type | mid_sid_type
+
+hardware:
+  gpu_peak_tflops: 312.0
+  gpu_hbm_gb: 80.0
+  intra_node_bw_gbps: 600.0

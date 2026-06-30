@@ -1,0 +1,18 @@
+# interleaved custom schedule
+
+profiled_data: true
+time_limit: 20000000
+
+model:
+  name: test_model
+
+parallel:
+  pp_size: 4
+  micro_batch_num: 8
+
+schedule: interleaved
+
+hardware:
+  gpu_peak_tflops: 312.0
+  gpu_hbm_gb: 80.0
+  comm_alpha_us: 0
