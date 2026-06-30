@@ -35,6 +35,8 @@ class Operator:
     profiled_bwd_time_us: float | None = None
     profiled_w_time_us: float | None = None
     flops: int | None = None
+    parameter_count: int = 0
+    expert_parameter_count: int = 0
     layer_idx: int | None = None
     is_checkpoint_boundary: bool = False
 

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 
 from simpipe.models.pattern import stage_layer_pattern_strings
 from simpipe.models.registry import stack_layer_symbols_for_model
+from simpipe.memory.estimate import estimate_pipeline_memory
 
 if TYPE_CHECKING:
     from simpipe.core.executor import Executor
@@ -48,6 +49,7 @@ def format_pipeline_config_yaml(
     chunk_num: int | None = None,
     makespan: float | None = None,
     stage_layers: list[str] | None = None,
+    memory: dict[str, Any] | None = None,
 ) -> str:
     lines = [
         f"schedule: {schedule}",
@@ -67,6 +69,8 @@ def format_pipeline_config_yaml(
         lines.append(f"chunk_num: {chunk_num}")
     if makespan is not None:
         lines.append(f"makespan: {makespan}")
+    if memory is not None:
+        lines.extend(_format_memory_yaml(memory))
     return "\n".join(lines) + "\n"
 
 
@@ -79,6 +83,7 @@ def build_pipeline_config(
     makespan: float | None = None,
     chunk_num: int | None = None,
     stage_layers: list[str] | None = None,
+    memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {
         "schedule": schedule,
@@ -92,6 +97,8 @@ def build_pipeline_config(
         data["chunk_num"] = chunk_num
     if makespan is not None:
         data["makespan"] = makespan
+    if memory is not None:
+        data["memory"] = memory
     return data
 
 
@@ -100,6 +107,7 @@ def build_pipeline_config_from_executor(
     *,
     scheduling_records: list[dict],
     makespan: float | None = None,
+    memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     partition = executor.plan.partition.layer_counts(executor.graph)
     stack_symbols = stack_layer_symbols_for_model(
@@ -111,6 +119,14 @@ def build_pipeline_config_from_executor(
         if stack_symbols is not None
         else None
     )
+    if memory is None:
+        memory = estimate_pipeline_memory(
+            executor.graph,
+            executor.plan,
+            executor.config.parallel,
+            executor.config.hardware,
+            scheduling_records,
+        ).to_dict()
     return build_pipeline_config(
         partition=partition,
         placement=executor.plan.placement.device_stages,
@@ -119,6 +135,7 @@ def build_pipeline_config_from_executor(
         makespan=makespan,
         chunk_num=executor.config.parallel.chunk_num,
         stage_layers=stage_layers,
+        memory=memory,
     )
 
 
@@ -132,6 +149,7 @@ def write_pipeline_config(
     makespan: float | None = None,
     chunk_num: int | None = None,
     executor: Executor | None = None,
+    memory: dict[str, Any] | None = None,
 ) -> None:
     if executor is not None:
         if scheduling_records is None:
@@ -140,6 +158,7 @@ def write_pipeline_config(
             executor,
             scheduling_records=scheduling_records,
             makespan=makespan,
+            memory=memory,
         )
     else:
         if partition is None or placement is None or schedule is None:
@@ -151,6 +170,7 @@ def write_pipeline_config(
             scheduling_records=scheduling_records or [],
             makespan=makespan,
             chunk_num=chunk_num,
+            memory=memory,
         )
     output.write_text(
         format_pipeline_config_yaml(
@@ -161,5 +181,44 @@ def write_pipeline_config(
             chunk_num=data.get("chunk_num"),
             makespan=data.get("makespan"),
             stage_layers=data.get("stage_layers"),
+            memory=data.get("memory"),
         )
     )
+
+
+def _format_memory_yaml(memory: dict[str, Any]) -> list[str]:
+    lines = [
+        "memory:",
+        f"  zero_stage: {memory.get('zero_stage', 0)}",
+        f"  peak_bytes: {memory.get('peak_bytes', 0)}",
+        f"  peak_gb: {memory.get('peak_gb', 0)}",
+        f"  feasible: {_format_scalar(memory.get('feasible', True))}",
+        f"  total_parameter_count: {memory.get('total_parameter_count', 0)}",
+        "  per_device:",
+    ]
+    for device in memory.get("per_device", []):
+        lines.extend(
+            [
+                f"  - did: {device.get('did', 0)}",
+                f"    pp_rank: {device.get('pp_rank', device.get('did', 0))}",
+                f"    stage_ids: {_format_inline_list(device.get('stage_ids', []))}",
+                f"    peak_bytes: {device.get('peak_bytes', 0)}",
+                f"    peak_gb: {device.get('peak_gb', 0)}",
+                f"    hbm_gb: {device.get('hbm_gb', 0)}",
+                f"    feasible: {_format_scalar(device.get('feasible', True))}",
+                f"    parameter_gb: {device.get('parameter_gb', 0)}",
+                f"    gradient_gb: {device.get('gradient_gb', 0)}",
+                f"    master_parameter_gb: {device.get('master_parameter_gb', 0)}",
+                f"    optimizer_moment_gb: {device.get('optimizer_moment_gb', 0)}",
+                f"    optimizer_gb: {device.get('optimizer_gb', 0)}",
+                f"    activation_peak_gb: {device.get('activation_peak_gb', 0)}",
+                f"    p2p_buffer_gb: {device.get('p2p_buffer_gb', 0)}",
+            ]
+        )
+    return lines
+
+
+def _format_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)

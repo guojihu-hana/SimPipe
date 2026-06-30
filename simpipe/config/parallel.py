@@ -10,10 +10,11 @@ class ParallelConfig:
     dp_size: int = 1
     ep_size: int = 1
     micro_batch_num: int = 8
-    zero_stage: int = 0
+    zero_stage: int = 1
     chunk_num: int | None = None  # None = auto (interleaved: max; else 1)
     bwd_split: bool = False
     vocab_parallel: bool = False
+    grad_reduce_in_fp32: bool = True
     overlap_aware: bool = True
     save_memory: bool = False
     constrain_warmup: bool = False

@@ -25,6 +25,7 @@ def build_embedding_operators(model: ModelConfig) -> list[Operator]:
             [token_ids],
             [embedded],
             flops=2 * b * s * v * h,
+            parameter_count=v * h,
             layer_idx=EMBEDDING_LAYER_IDX,
         )
     ]
@@ -41,6 +42,7 @@ def build_head_operators(model: ModelConfig) -> list[Operator]:
             [hidden],
             [logits],
             flops=2 * b * s * h * v,
+            parameter_count=h * v,
             layer_idx=head_layer_idx(model.num_layers),
         )
     ]

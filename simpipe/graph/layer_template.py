@@ -42,6 +42,7 @@ class TransformerBlockTemplate(LayerTemplate):
                 [hidden],
                 [qkv_out],
                 flops=qkv_flops,
+                parameter_count=h * (3 * h),
                 layer_idx=layer_idx,
             ),
             Operator(
@@ -58,6 +59,7 @@ class TransformerBlockTemplate(LayerTemplate):
                 [attn_out],
                 [hidden],
                 flops=proj_flops,
+                parameter_count=h * h,
                 layer_idx=layer_idx,
             ),
             Operator(f"{prefix}_ln1", OpType.LAYERNORM, [hidden], [hidden], flops=b * s * h, layer_idx=layer_idx),
@@ -67,6 +69,7 @@ class TransformerBlockTemplate(LayerTemplate):
                 [hidden],
                 [TensorSpec(f"{prefix}_gate", (b, s, inter))],
                 flops=2 * b * s * h * inter,
+                parameter_count=h * inter,
                 layer_idx=layer_idx,
             ),
             Operator(
@@ -75,6 +78,7 @@ class TransformerBlockTemplate(LayerTemplate):
                 [hidden],
                 [TensorSpec(f"{prefix}_up", (b, s, inter))],
                 flops=2 * b * s * h * inter,
+                parameter_count=h * inter,
                 layer_idx=layer_idx,
             ),
             Operator(
@@ -83,6 +87,7 @@ class TransformerBlockTemplate(LayerTemplate):
                 [TensorSpec(f"{prefix}_gate", (b, s, inter))],
                 [mlp_out],
                 flops=2 * b * s * inter * h,
+                parameter_count=inter * h,
                 layer_idx=layer_idx,
             ),
         ]
@@ -106,6 +111,7 @@ class MoELayerTemplate(LayerTemplate):
                 [hidden],
                 [router_out],
                 flops=b * s * h * model.num_experts,
+                parameter_count=h * model.num_experts,
                 layer_idx=layer_idx,
             )
         )
@@ -126,6 +132,7 @@ class MoELayerTemplate(LayerTemplate):
                     [TensorSpec(f"{prefix}_dispatched", (b * model.top_k, s, h))],
                     [TensorSpec(f"{prefix}_expert_out_{e}", (b * model.top_k, s, h))],
                     flops=2 * b * s * h * model.intermediate_size,
+                    expert_parameter_count=3 * h * model.intermediate_size,
                     layer_idx=layer_idx,
                 )
             )

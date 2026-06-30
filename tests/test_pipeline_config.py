@@ -88,15 +88,48 @@ def test_build_pipeline_config_from_executor(tmp_path):
         executor=executor,
         makespan=result.makespan,
         scheduling_records=result.records,
+        memory=result.memory.to_dict() if result.memory else None,
     )
 
     data = yaml.safe_load(out.read_text())
     assert data["partition"] == [6, 6, 6, 6, 6, 6, 6, 6]
     assert data["placement"] == [[0, 4], [1, 5], [2, 6], [3, 7]]
     assert data["makespan"] == result.makespan
+    assert data["memory"]["zero_stage"] == cfg.parallel.zero_stage
+    assert len(data["memory"]["per_device"]) == cfg.parallel.pp_size
+    assert data["memory"]["per_device"][0]["peak_bytes"] > 0
     assert len(data["scheduling"]) == len(result.records)
     for entry in data["scheduling"]:
         assert entry.startswith("(") and entry.endswith(")")
+
+
+def test_write_pipeline_config_uses_precomputed_executor_memory(tmp_path):
+    from dataclasses import replace
+
+    from simpipe.config.hardware import HardwareConfig
+    from simpipe.core.executor import build_simulation
+    from simpipe.models.registry import get_preset
+
+    cfg = get_preset("test_model")
+    cfg = replace(cfg, hardware=HardwareConfig(comm_alpha_us=0))
+    executor = build_simulation(cfg, layer_f_times=[1.0] * cfg.model.num_layers)
+    result = executor.run()
+    memory = result.memory.to_dict()
+    memory["peak_bytes"] = 123
+    memory["peak_gb"] = 0.123
+    out = tmp_path / "pipeline_config.yaml"
+
+    write_pipeline_config(
+        out,
+        executor=executor,
+        makespan=result.makespan,
+        scheduling_records=result.records,
+        memory=memory,
+    )
+
+    data = yaml.safe_load(out.read_text())
+    assert data["memory"]["peak_bytes"] == 123
+    assert data["memory"]["peak_gb"] == 0.123
 
 
 def test_build_pipeline_config_from_executor_includes_stage_layers(tmp_path):

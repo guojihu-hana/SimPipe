@@ -9,6 +9,7 @@ from simpipe.core.runtime import PipelineRuntime
 from simpipe.core.types import Schedule
 from simpipe.core.types import WorkloadType
 from simpipe.graph.model_graph import ModelGraph
+from simpipe.memory.estimate import PipelineMemoryEstimate, estimate_pipeline_memory
 from simpipe.pipeline.partition import OperatorPartition, layer_partition_to_stage_specs
 from simpipe.pipeline.placement import Placement
 from simpipe.pipeline.schedule_config import (
@@ -27,6 +28,7 @@ class SimulationResult:
     makespan: float
     records: list[dict]
     idle_per_device: list[float]
+    memory: PipelineMemoryEstimate | None = None
 
 
 class Executor:
@@ -87,10 +89,19 @@ class Executor:
             all_records.extend(res["records"])
             for d in pipeline.devices:
                 idle[d.did] += d.idle_time
+        makespan = max((r.get("end") or 0 for r in all_records), default=0)
+        memory = estimate_pipeline_memory(
+            self.graph,
+            self.plan,
+            self.config.parallel,
+            self.config.hardware,
+            all_records,
+        )
         return SimulationResult(
-            makespan=max((r.get("end") or 0 for r in all_records), default=0),
+            makespan=makespan,
             records=all_records,
             idle_per_device=idle,
+            memory=memory,
         )
 
 

@@ -120,10 +120,23 @@ def run_cmd(config: str | None, model: str, schedule: str | None, output: str) -
         executor=executor,
         makespan=result.makespan,
         scheduling_records=result.records,
+        memory=result.memory.to_dict() if result.memory else None,
     )
     stats = analyze_pipeline_comp_bubble(result.records, device_num=cfg.parallel.pp_size)
     click.echo(f"Makespan: {result.makespan}")
     click.echo(f"Bubble ratio: {stats.avg_bubble_ratio(cfg.parallel.pp_size):.2%}")
+    if result.memory:
+        click.echo(f"Peak memory: {result.memory.peak_bytes / 1024**3:.2f} GiB")
+        for device in result.memory.per_device:
+            status = "OK" if device.feasible else "OOM"
+            click.echo(
+                f"  D{device.did}: peak={device.peak_bytes / 1024**3:.2f} GiB "
+                f"(model={device.model_state_bytes / 1024**3:.2f}, "
+                f"master={device.master_parameter_bytes / 1024**3:.2f}, "
+                f"moments={device.optimizer_moment_bytes / 1024**3:.2f}, "
+                f"act={device.activation_peak_bytes / 1024**3:.2f}, "
+                f"p2p={device.p2p_buffer_bytes / 1024**3:.2f}) {status}"
+            )
     click.echo(f"Results written to {out}")
 
 
