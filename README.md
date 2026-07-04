@@ -1,6 +1,6 @@
 # SimPipe
 
-LLM training pipeline parallelism simulator with operator-level graph IR, PP/TP/DP modeling, memory/ZeRO analysis, and MoE support.
+Pipeline parallelism simulator of OctoPipe (SC26, arXiv version: https://arxiv.org/abs/2509.23722).
 
 ## Install
 
@@ -11,13 +11,13 @@ pip install -e ".[dev]"
 ## Quick start
 
 ```bash
-simpipe run --config examples/nemotronh_4gpu.yaml --schedule 1f1b --output ./results/
-simpipe sweep --config examples/sweep_3d_parallel.yaml --output ./sweep_results/
+simpipe run --config examples/1f1b_custom.yaml --output ./results/1f1b/
+simpipe run --config examples/octopipe_auto_tune.yaml --output ./results/octopipe/
 ```
 
 ## OctoPipe Auto-Tune
 
-OctoPipe can search pipeline partitions and stage placements automatically. Use `schedule: octopipe` and omit `partition_layers` / `placement`, or set `tuning.auto_tune: true`.
+SimPipe can search pipeline partitions, stage placements, and schedules automatically. Use `schedule: octopipe` and omit `partition_layers` / `placement`, or set `tuning.auto_tune: true`.
 
 ```bash
 simpipe run --config examples/octopipe_auto_tune.yaml --output ./results/octopipe/
@@ -26,10 +26,63 @@ simpipe run --config examples/octopipe_auto_tune.yaml --output ./results/octopip
 The run writes:
 
 - `pipeline_gantt.svg` — per-rank schedule visualization.
-- `detailed_info.md` — detailed Gantt time statistics and layout tables.
-- `pipeline_config.yaml` — selected partition, placement, schedule records, stage layer pattern, makespan, and memory estimate.
+- `detailed_info.md` — detailed pipeline statistics.
+- `pipeline_config.yaml` — selected partition, placement, schedule records, stage layer pattern, execution time, and memory estimate.
 
 By default, `pipeline_gantt.svg` contains only the schedule plot. Pass `--detailed-gantt` to also render the detailed tables below the chart.
+
+### Examples
+
+<table>
+  <tr>
+    <th>Gantt</th>
+    <th>Detailed Info</th>
+  </tr>
+  <tr>
+    <td valign="top"><img src="images/1f1b.svg" alt="1F1B schedule" width="520"></td>
+    <td valign="top">
+      <strong>1F1B</strong>
+      <table>
+        <tr><th>Start</th><th>End</th></tr>
+        <tr><td>0</td><td>133121</td></tr>
+      </table>
+      <table>
+        <tr><th>Device</th><th>Computation</th><th>Bubble</th><th>Warmup</th><th>Residual</th><th>Cooldown</th><th>Total</th></tr>
+        <tr><td>D0</td><td>85000 (63.9%)</td><td>48121 (36.1%)</td><td>811</td><td>36036</td><td>11274</td><td>133121 (100%)</td></tr>
+        <tr><td>D1</td><td>76160 (57.2%)</td><td>56961 (42.8%)</td><td>4819</td><td>36508</td><td>15634</td><td>133121 (100%)</td></tr>
+        <tr><td>D2</td><td>76160 (57.2%)</td><td>56961 (42.8%)</td><td>7923</td><td>28811</td><td>20227</td><td>133121 (100%)</td></tr>
+        <tr><td>D3</td><td>103456 (77.7%)</td><td>29665 (22.3%)</td><td>9538</td><td>0</td><td>20127</td><td>133121 (100%)</td></tr>
+      </table>
+      <table>
+        <tr><th>Item</th><th>Value</th></tr>
+        <tr><td>Partition</td><td>[14, 14, 14, 14]</td></tr>
+        <tr><td>Placement</td><td>[[0], [1], [2], [3]]</td></tr>
+      </table>
+    </td>
+  </tr>
+  <tr>
+    <td valign="top"><img src="images/octopipe.svg" alt="OctoPipe schedule" width="520"></td>
+    <td valign="top">
+      <strong>OctoPipe</strong>
+      <table>
+        <tr><th>Start</th><th>End</th></tr>
+        <tr><td>0</td><td>89870</td></tr>
+      </table>
+      <table>
+        <tr><th>Device</th><th>Computation</th><th>Bubble</th><th>Warmup</th><th>Residual</th><th>Cooldown</th><th>Total</th></tr>
+        <tr><td>D0</td><td>86392 (96.1%)</td><td>3478 (3.9%)</td><td>79</td><td>3399</td><td>0</td><td>89870 (100%)</td></tr>
+        <tr><td>D1</td><td>84880 (94.4%)</td><td>4990 (5.6%)</td><td>833</td><td>3313</td><td>844</td><td>89870 (100%)</td></tr>
+        <tr><td>D2</td><td>84728 (94.3%)</td><td>5142 (5.7%)</td><td>2423</td><td>1021</td><td>1698</td><td>89870 (100%)</td></tr>
+        <tr><td>D3</td><td>84776 (94.3%)</td><td>5094 (5.7%)</td><td>2707</td><td>210</td><td>2177</td><td>89870 (100%)</td></tr>
+      </table>
+      <table>
+        <tr><th>Item</th><th>Value</th></tr>
+        <tr><td>Partition</td><td>[2, 2, 2, 2, 2, 2, 2, 3, 2, 3, 2, 3, 2, 3, 3, 2, 3, 3, 2, 2, 2, 3, 3, 1]</td></tr>
+        <tr><td>Placement</td><td>[[0, 4, 8, 12, 16, 19, 20], [1, 5, 9, 13, 17, 21], [2, 6, 10, 14, 18, 22], [3, 7, 11, 15, 23]]</td></tr>
+      </table>
+    </td>
+  </tr>
+</table>
 
 ### Example Config
 
