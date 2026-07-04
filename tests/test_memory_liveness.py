@@ -46,7 +46,7 @@ def test_hf_config_loads_model_shape_and_parameter_spec():
 
 def test_hybrid_hf_pattern_uses_layer_specific_parameter_formulas():
     model = ModelConfig(
-        name="nemotronh-nano-v2-9B",
+        name="nemotron-nano-v2-9B",
         hf_config_path="simpipe/models/hf_configs/NemotronNanoV2-9B.json",
     )
     spec = model_parameter_spec(model)

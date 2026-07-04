@@ -41,11 +41,18 @@ _TABLE_CHAR_W_BOLD = 6.3
 _TABLE_SPACING_SCALE = 1.1
 _TABLE_CELL_PAD_L = 6.0 * _TABLE_SPACING_SCALE
 _TABLE_COL_GAP = 6.0 * _TABLE_SPACING_SCALE
+LEGEND_SIZE = 24.0
+BLOCK_FONT_SIZE = 16.0
+TITLE_TO_PLOT_GAP = 0.0
 
 
 def _estimate_text_width(text: str, *, bold: bool = False) -> float:
     factor = _TABLE_CHAR_W_BOLD if bold else _TABLE_CHAR_W
     return len(text) * factor
+
+
+def _estimate_text_width_at_size(text: str, size: float, *, bold: bool = False) -> float:
+    return _estimate_text_width(text, bold=bold) * (size / 12.0)
 
 
 def _fit_column_widths(headers: list[str], rows: list[list[str]]) -> list[float]:
@@ -139,6 +146,14 @@ def _device_stats_table_rows(stats: list[dict]) -> tuple[list[str], list[list[st
     return headers, rows
 
 
+def _markdown_table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    return [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+        *["| " + " | ".join(row) + " |" for row in rows],
+    ]
+
+
 def _format_placement_lines(placement: list[list[int]]) -> list[str]:
     if not placement:
         return ["placement = []"]
@@ -156,6 +171,59 @@ def _partition_placement_lines(
     placement: list[list[int]],
 ) -> list[str]:
     return [f"partition = {partition_layers}", *_format_placement_lines(placement)]
+
+
+def _layout_table_rows(
+    partition_layers: list[int] | None,
+    placement: list[list[int]] | None,
+) -> tuple[list[str], list[list[str]]]:
+    headers = ["Item", "Value"]
+    rows: list[list[str]] = []
+    if partition_layers is not None:
+        rows.append(["Partition", str(partition_layers)])
+    if placement is not None:
+        rows.append(["Placement", str(placement)])
+    return headers, rows
+
+
+def format_gantt_detailed_info(
+    records: list[dict],
+    *,
+    partition_layers: list[int] | None = None,
+    placement: list[list[int]] | None = None,
+) -> str:
+    if not records:
+        return "No data\n"
+
+    stats = analyze_pipeline_comp_bubble(records).to_dict()["per_device"]
+    headers, table_rows = _device_stats_table_rows(stats)
+    max_t = max(float(record.get("end") or record.get("start") or 0) for record in records)
+
+    lines = [
+        "# Gantt Detailed Info",
+        "",
+        "## Time Range",
+        "",
+        "| Start | End |",
+        "| --- | --- |",
+        f"| 0 | {max_t:.0f} |",
+        "",
+        "## Device Time Statistics",
+        "",
+        *_markdown_table(headers, table_rows),
+    ]
+
+    layout_headers, layout_rows = _layout_table_rows(partition_layers, placement)
+    if layout_rows:
+        lines.extend(
+            [
+                "",
+                "## Pipeline Layout",
+                "",
+                *_markdown_table(layout_headers, layout_rows),
+            ]
+        )
+    return "\n".join(lines) + "\n"
 
 
 def _append_text_block(
@@ -177,6 +245,54 @@ def _append_text_block(
     return row_h * len(lines), block_w
 
 
+def _centered_text_baseline(rect_y: float, rect_h: float, font_size: float) -> float:
+    return rect_y + (rect_h + font_size * 0.6) / 2.0
+
+
+def _legend_items() -> list[tuple[str, str, bool]]:
+    return [
+        ("F", _COLOR_F, True),
+        ("B", _COLOR_B, True),
+        ("W", _COLOR_W, True),
+        ("Bubble", _COLOR_BUBBLE, False),
+    ]
+
+
+def _legend_width(size: float = LEGEND_SIZE) -> float:
+    block_w = max(size * 3.5, _estimate_text_width_at_size("mid,sid", BLOCK_FONT_SIZE) + size * 0.8)
+    text_gap = size * 0.45
+    item_gap = size * 1.4
+    return sum(
+        block_w + text_gap + _estimate_text_width_at_size(label, size) + item_gap
+        for label, _color, _show_block_label in _legend_items()
+    )
+
+
+def _append_legend(parts: list[str], x: float, baseline_y: float, *, size: float = LEGEND_SIZE) -> None:
+    block_w = max(size * 3.5, _estimate_text_width_at_size("mid,sid", BLOCK_FONT_SIZE) + size * 0.8)
+    text_gap = size * 0.45
+    item_gap = size * 1.4
+    block_y = baseline_y - size * 0.82
+    cursor = 0.0
+    for label, color, show_block_label in _legend_items():
+        item_x = x + cursor
+        parts.append(
+            f'<rect x="{item_x:.1f}" y="{block_y:.1f}" width="{block_w:.1f}" height="{size:.1f}" '
+            f'fill="{color}" stroke="{_STROKE}" stroke-width="1" rx="1"/>'
+        )
+        if show_block_label:
+            parts.append(
+                f'<text x="{item_x + block_w / 2.0:.1f}" '
+                f'y="{_centered_text_baseline(block_y, size, BLOCK_FONT_SIZE):.1f}" '
+                f'text-anchor="middle" fill="#111" font-size="{BLOCK_FONT_SIZE:.0f}">mid,sid</text>'
+            )
+        parts.append(
+            f'<text x="{item_x + block_w + text_gap:.1f}" y="{baseline_y:.1f}" '
+            f'font-size="{size:.0f}">{label}</text>'
+        )
+        cursor += block_w + text_gap + _estimate_text_width_at_size(label, size) + item_gap
+
+
 def write_gantt_svg(
     records: list[dict],
     output: Path,
@@ -191,6 +307,7 @@ def write_gantt_svg(
     margin_l: float = 36.0,
     margin_t: float = 40.0,
     margin_b: float = 32.0,
+    detailed: bool = False,
 ) -> None:
     """Render pipeline Gantt: one row per device, blocks at start/end time."""
     if not records:
@@ -225,29 +342,45 @@ def write_gantt_svg(
     min_scale = (min_workload_px + 2 * pad) / min_duration
     scale = max(base_plot_w / span, min_scale)
     plot_w = span * scale
-    stats = analyze_pipeline_comp_bubble(
-        [
-            {"did": did, "mid": mid, "sid": sid, "wtype": wtype, "start": start, "end": end}
-            for wtype, mid, sid, did, start, end in blocks
-        ]
-    ).to_dict()["per_device"]
-    headers, table_rows = _device_stats_table_rows(stats)
-    stats_table_w = sum(_fit_column_widths(headers, table_rows))
+    stats: list[dict] = []
+    headers: list[str] = []
+    table_rows: list[list[str]] = []
+    stats_table_w = 0.0
     stats_row_h = 18.0
     panel_gap = 24.0 * _TABLE_SPACING_SCALE
     config_lines: list[str] = []
     config_block_w = 0.0
     config_block_h = 0.0
-    if partition_layers is not None and placement is not None:
-        config_lines = _partition_placement_lines(partition_layers, placement)
-        config_block_w = max(_estimate_text_width(line) for line in config_lines)
-        config_block_h = stats_row_h * len(config_lines)
-    bottom_w = stats_table_w + (panel_gap + config_block_w if config_lines else 0.0)
-    width = max(width, margin_l + plot_w + 16.0, margin_l + bottom_w + 16.0)
-    table_title_h = 18.0
-    stats_body_h = stats_row_h * (len(stats) + 1)
-    table_body_h = max(stats_body_h, config_block_h)
-    table_h = table_title_h + table_body_h + 8.0
+    bottom_w = 0.0
+    table_h = 0.0
+    if detailed:
+        stats = analyze_pipeline_comp_bubble(
+            [
+                {"did": did, "mid": mid, "sid": sid, "wtype": wtype, "start": start, "end": end}
+                for wtype, mid, sid, did, start, end in blocks
+            ]
+        ).to_dict()["per_device"]
+        headers, table_rows = _device_stats_table_rows(stats)
+        stats_table_w = sum(_fit_column_widths(headers, table_rows))
+        if partition_layers is not None and placement is not None:
+            config_lines = _partition_placement_lines(partition_layers, placement)
+            config_block_w = max(_estimate_text_width(line) for line in config_lines)
+            config_block_h = stats_row_h * len(config_lines)
+        bottom_w = stats_table_w + (panel_gap + config_block_w if config_lines else 0.0)
+        table_title_h = 18.0
+        stats_body_h = stats_row_h * (len(stats) + 1)
+        table_body_h = max(stats_body_h, config_block_h)
+        table_h = table_title_h + table_body_h + 8.0
+    legend_w = _legend_width()
+    title_reserved_w = _estimate_text_width_at_size(title, LEGEND_SIZE) + LEGEND_SIZE * 3.0
+    width = max(
+        width,
+        margin_l + plot_w + 16.0,
+        margin_l + bottom_w + 16.0,
+        margin_l + title_reserved_w + legend_w + 16.0,
+    )
+    title_y = max(22.0, LEGEND_SIZE * 1.05)
+    margin_t = max(margin_t, title_y + LEGEND_SIZE + TITLE_TO_PLOT_GAP)
     height = margin_t + n_dev * row_h + margin_b + table_h
 
     def x_pos(t: float) -> float:
@@ -256,11 +389,11 @@ def write_gantt_svg(
     parts: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width:.0f}" height="{height:.0f}" '
         f'viewBox="0 0 {width:.0f} {height:.0f}">',
-        '<style>text{font-family:system-ui,Segoe UI,sans-serif;font-size:12px;}</style>',
+        '<style>text{font-family:system-ui,Segoe UI,sans-serif;}</style>',
         f'<rect x="0" y="0" width="{width:.0f}" height="{height:.0f}" fill="#ffffff"/>',
-        f'<text x="{margin_l:.0f}" y="22">{_esc(title)}</text>',
-        f'<text x="{margin_l:.0f}" y="{height - 10:.0f}">time: ({min_t:.0f}, {max_t:.0f})</text>',
+        f'<text x="{margin_l:.0f}" y="{title_y:.0f}" font-size="{LEGEND_SIZE:.0f}">{_esc(title)}</text>',
     ]
+    _append_legend(parts, width - legend_w - 16.0, title_y)
 
     # One lane per device
     for d in range(n_dev):
@@ -306,53 +439,38 @@ def write_gantt_svg(
         )
         # label = f"{wtype[0].lower()}{mid}_{sid}"
         label = f"{mid},{sid}"
+        block_y = y0 + pad
+        block_h = row_h - 2 * pad
         parts.append(
-            f'<text x="{x0 + wpx / 2:.1f}" y="{y0 + row_h * 0.65:.1f}" '
-            f'text-anchor="middle" fill="#111">{label}</text>',
+            f'<text x="{x0 + wpx / 2:.1f}" '
+            f'y="{_centered_text_baseline(block_y, block_h, BLOCK_FONT_SIZE):.1f}" '
+            f'text-anchor="middle" fill="#111" font-size="{BLOCK_FONT_SIZE:.0f}">{label}</text>',
         )
 
-    # Legend: 1 row × 3 columns
-    legend_y = 22
-    col_w = 92
-    legend_items = [
-        ("F forward", _COLOR_F, ""),
-        ("B backward", _COLOR_B, ""),
-        ("W weight", _COLOR_W, ""),
-        ("bubble", _COLOR_BUBBLE, ""),
-    ]
-    legend_x = width - col_w * len(legend_items) - 8
-    for i, (label, col, extra) in enumerate(legend_items):
-        x = legend_x + i * col_w
+    if detailed:
+        table_y = margin_t + n_dev * row_h + 20.0
+        table_top = table_y + 8.0
         parts.append(
-            f'<rect x="{x:.0f}" y="{legend_y - 10:.0f}" width="12" height="12" '
-            f'fill="{col}" stroke="{_STROKE}" stroke-width="1"{extra}/>'
+            f'<text x="{margin_l:.0f}" y="{table_y:.0f}" font-weight="600">Device Time Statistics</text>'
         )
-        parts.append(f'<text x="{x + 16:.0f}" y="{legend_y:.0f}" font-size="12">{label}</text>')
-
-    table_y = margin_t + n_dev * row_h + 20.0
-    table_top = table_y + 8.0
-    parts.append(
-        f'<text x="{margin_l:.0f}" y="{table_y:.0f}" font-weight="600">Device Time Statistics</text>'
-    )
-    _append_three_line_table(
-        parts,
-        margin_l,
-        table_top,
-        headers,
-        table_rows,
-        row_h=stats_row_h,
-    )
-    if config_lines:
-        config_x = margin_l + stats_table_w + panel_gap
-        _append_text_block(
+        _append_three_line_table(
             parts,
-            config_x,
+            margin_l,
             table_top,
-            config_lines,
+            headers,
+            table_rows,
             row_h=stats_row_h,
         )
+        if config_lines:
+            config_x = margin_l + stats_table_w + panel_gap
+            _append_text_block(
+                parts,
+                config_x,
+                table_top,
+                config_lines,
+                row_h=stats_row_h,
+            )
+        parts.append(f'<text x="{margin_l:.0f}" y="{height - 10:.0f}">time: ({min_t:.0f}, {max_t:.0f})</text>')
 
     parts.append("</svg>")
     output.write_text("\n".join(parts))
-
-

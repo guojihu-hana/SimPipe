@@ -26,7 +26,10 @@ simpipe run --config examples/octopipe_auto_tune.yaml --output ./results/octopip
 The run writes:
 
 - `pipeline_gantt.svg` — per-rank schedule visualization.
+- `detailed_info.md` — detailed Gantt time statistics and layout tables.
 - `pipeline_config.yaml` — selected partition, placement, schedule records, stage layer pattern, makespan, and memory estimate.
+
+By default, `pipeline_gantt.svg` contains only the schedule plot. Pass `--detailed-gantt` to also render the detailed tables below the chart.
 
 ### Example Config
 
@@ -35,7 +38,7 @@ profiled_data: true
 time_limit: 20000000
 
 model:
-  name: nemotronh-nano-v2-9B
+  name: nemotron-nano-v2-9B
   hf_config_path: simpipe/models/hf_configs/NemotronNanoV2-9B.json
   seq_len: 4096
   micro_batch_size: 1

@@ -12,7 +12,7 @@ from simpipe.metrics.comp_bubble import analyze_pipeline_comp_bubble
 from simpipe.models.registry import PRESETS, get_preset, get_profile_times, preset_model_data
 from simpipe.tuning.bubble_overlap import format_group
 from simpipe.tuning.sweep import run_sweep, sweep_configs
-from simpipe.viz.gantt import write_gantt_svg
+from simpipe.viz.gantt import format_gantt_detailed_info, write_gantt_svg
 
 
 def _load_config_with_profiled_defaults(config: str) -> SimConfig:
@@ -52,7 +52,19 @@ def main() -> None:
 @click.option("--model", default="nemotronh-4B")
 @click.option("--schedule", default=None, help="Override schedule from config (default: use config or 1f1b)")
 @click.option("--output", type=click.Path(), default="./results")
-def run_cmd(config: str | None, model: str, schedule: str | None, output: str) -> None:
+@click.option(
+    "--detailed-gantt",
+    is_flag=True,
+    default=False,
+    help="Render detailed statistics and layout tables below the Gantt chart.",
+)
+def run_cmd(
+    config: str | None,
+    model: str,
+    schedule: str | None,
+    output: str,
+    detailed_gantt: bool,
+) -> None:
     cfg, profile = _load_run_inputs(config, model, schedule)
 
     executor = build_simulation(
@@ -108,12 +120,22 @@ def run_cmd(config: str | None, model: str, schedule: str | None, output: str) -
     out = Path(output)
     out.mkdir(parents=True, exist_ok=True)
     sched_label = cfg.schedule
+    partition_layers = executor.plan.partition.layer_counts(executor.graph)
+    placement = executor.plan.placement.device_stages
     write_gantt_svg(
         result.records,
         out / "pipeline_gantt.svg",
         title=f"{cfg.model.name} {sched_label}",
-        partition_layers=executor.plan.partition.layer_counts(executor.graph),
-        placement=executor.plan.placement.device_stages,
+        partition_layers=partition_layers,
+        placement=placement,
+        detailed=detailed_gantt,
+    )
+    (out / "detailed_info.md").write_text(
+        format_gantt_detailed_info(
+            result.records,
+            partition_layers=partition_layers,
+            placement=placement,
+        )
     )
     write_pipeline_config(
         out / "pipeline_config.yaml",

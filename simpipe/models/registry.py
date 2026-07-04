@@ -57,9 +57,9 @@ PRESETS: dict[str, dict] = {
         "forward_ms": _NEMOTRONH_FORWARD_MS,
         "backward_ms": _NEMOTRONH_BACKWARD_MS,
     },
-    "nemotronh-nano-v2-9B": {
+    "nemotron-nano-v2-9B": {
         "model": {
-            "name": "nemotronh-nano-v2-9B",
+            "name": "nemotron-nano-v2-9B",
             "hidden_size": 4480,
             "num_attention_heads": 40,
             "seq_len": 4096,

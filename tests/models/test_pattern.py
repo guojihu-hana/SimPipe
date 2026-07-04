@@ -89,7 +89,7 @@ def test_nemotron_nano_v2_profile_times_use_weight_ms():
         get_profile_times,
     )
 
-    profile = get_profile_times("nemotronh-nano-v2-9B")
+    profile = get_profile_times("nemotron-nano-v2-9B")
 
     assert stack_layer_count(_NEMOTRON_NANO_V2_PATTERN) == 56
     assert len(profile.layer_w) == 56
@@ -99,7 +99,7 @@ def test_nemotron_nano_v2_profile_times_use_weight_ms():
     assert profile.head_w == 6.0
     assert profile.embedding_w != 287
 
-    cfg = get_preset("nemotronh-nano-v2-9B")
+    cfg = get_preset("nemotron-nano-v2-9B")
     assert cfg.model.num_layers == 56
 
 
