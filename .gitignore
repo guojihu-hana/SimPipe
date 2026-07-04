@@ -8,5 +8,6 @@ build/
 results/
 sweep_results/
 *.svg
+!images/*.svg
 .DS_Store
 *.sh
