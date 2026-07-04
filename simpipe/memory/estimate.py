@@ -13,7 +13,7 @@ from simpipe.graph.operator import OpType, Operator
 from simpipe.graph.model_graph import EMBEDDING_LAYER_IDX, ModelGraph, head_layer_idx
 from simpipe.graph.tensor import TensorKind, tensor_bytes
 from simpipe.memory.zero import ZeroMemoryShard, zero_model_state_bytes
-from simpipe.models.pattern import ATTN, MAMBA, MLP, stack_layer_symbols
+from simpipe.models.pattern import ATTN, MAMBA, MLP, MOE, TRANSFORMER, stack_layer_symbols
 from simpipe.pipeline.types import WorkloadPlan
 
 
@@ -497,6 +497,31 @@ def _hybrid_layer_parameter_count(
                 _attention_parameter_count(data, hidden, heads, head_dim, kv_heads, rope_dim)
                 + _norm_parameter_count(hidden, 1)
             )
+        )
+    if symbol == TRANSFORMER:
+        return LayerParameterCount(
+            non_expert=(
+                _attention_parameter_count(data, hidden, heads, head_dim, kv_heads, rope_dim)
+                + _norm_parameter_count(hidden, 2)
+                + 3 * hidden * inter
+            )
+        )
+    if symbol == MOE:
+        routed_experts = int(
+            data.get("n_routed_experts")
+            or data.get("num_experts")
+            or data.get("n_experts")
+            or 0
+        )
+        shared_experts = int(data.get("n_shared_experts", 0) or 0)
+        return LayerParameterCount(
+            non_expert=(
+                _attention_parameter_count(data, hidden, heads, head_dim, kv_heads, rope_dim)
+                + _norm_parameter_count(hidden, 2)
+                + hidden * routed_experts
+                + shared_experts * 3 * hidden * inter
+            ),
+            expert=routed_experts * 3 * hidden * inter,
         )
     raise ValueError(f"Unsupported hybrid layer symbol: {symbol!r}")
 

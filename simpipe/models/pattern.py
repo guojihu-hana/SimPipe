@@ -2,22 +2,26 @@ from __future__ import annotations
 
 # Pattern symbols (each character in the pattern string is one layer):
 #   E = embedding, L = head
-#   M = mamba, - = mlp, * = attn
+#   M = mamba, - = mlp, * = attn, T = transformer, # = moe
 MAMBA = "M"
 ATTN = "*"
 MLP = "-"
+TRANSFORMER = "T"
+MOE = "#"
 EMBEDDING = "E"
 HEAD = "L"
 
-STACK_LAYER_SYMBOLS = frozenset({MAMBA, ATTN, MLP})
+STACK_LAYER_SYMBOLS = frozenset({MAMBA, ATTN, MLP, TRANSFORMER, MOE})
 LAYER_SYMBOLS = STACK_LAYER_SYMBOLS | {EMBEDDING, HEAD}
-PATTERN_CHARS = frozenset({MAMBA, ATTN, MLP, EMBEDDING, HEAD})
+PATTERN_CHARS = frozenset({MAMBA, ATTN, MLP, TRANSFORMER, MOE, EMBEDDING, HEAD})
 
 LAYER_KIND: dict[str, str] = {
     EMBEDDING: "embedding",
     MAMBA: "mamba",
     ATTN: "attn",
     MLP: "mlp",
+    TRANSFORMER: "transformer",
+    MOE: "moe",
     HEAD: "head",
 }
 
@@ -25,6 +29,8 @@ CHAR_TO_SYMBOL = {
     "M": MAMBA,
     "-": MLP,
     "*": ATTN,
+    "T": TRANSFORMER,
+    "#": MOE,
     "E": EMBEDDING,
     "L": HEAD,
 }
@@ -38,6 +44,11 @@ TIMING_KEY_ALIASES: dict[str, str] = {
     "attn": ATTN,
     "attention": ATTN,
     "mlp": MLP,
+    "transformer": TRANSFORMER,
+    "transformer_layer": TRANSFORMER,
+    "dense": TRANSFORMER,
+    "moe": MOE,
+    "moe_layer": MOE,
     "head": HEAD,
 }
 
@@ -130,13 +141,7 @@ def stage_layer_pattern_strings(
 
 
 def pattern_tokens(pattern: str) -> list[str]:
-    stack = stack_layer_symbols(pattern)
-    normalized = list(stack)
-    if EMBEDDING not in normalized and "E" not in pattern:
-        normalized.insert(0, EMBEDDING)
-    if HEAD not in normalized and "L" not in pattern:
-        normalized.append(HEAD)
-    return normalized
+    return normalize_pattern_tokens(tokenize_pattern(pattern))
 
 
 def layer_count(pattern: str) -> int:

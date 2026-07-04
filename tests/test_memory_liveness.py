@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from simpipe.config.model import ModelConfig
@@ -53,6 +55,35 @@ def test_hybrid_hf_pattern_uses_layer_specific_parameter_formulas():
     assert len(spec.layers) == 56
     assert 8_000_000_000 < total_params < 10_000_000_000
     assert len({layer.total for layer in spec.layers}) > 1
+
+
+def test_hybrid_hf_pattern_supports_transformer_and_moe_symbols(tmp_path):
+    cfg_path = tmp_path / "hybrid.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "intermediate_size": 256,
+                "vocab_size": 128,
+                "torch_dtype": "bfloat16",
+                "hybrid_override_pattern": "T#",
+                "n_routed_experts": 8,
+                "n_shared_experts": 1,
+            }
+        )
+    )
+
+    model = ModelConfig(hf_config_path=str(cfg_path))
+    spec = model_parameter_spec(model)
+
+    assert len(spec.layers) == 2
+    assert spec.layers[0].expert == 0
+    assert spec.layers[0].non_expert > 0
+    assert spec.layers[1].expert > 0
+    assert spec.layers[1].non_expert > spec.layers[0].non_expert
 
 
 def test_pipeline_memory_estimate_per_pp_rank_with_zero():

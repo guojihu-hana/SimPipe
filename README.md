@@ -82,7 +82,7 @@ Model shape is configured under `model:`. The fields are defined in `simpipe/con
 Timing profile data is selected by `profiled_data: true` plus `model.name`.
 
 - Preset layer timings are in `simpipe/models/registry.py`.
-- Hybrid model layer patterns use symbols `M` = Mamba, `-` = MLP, `*` = Attention.
+- Hybrid model layer patterns use symbols `M` = Mamba, `-` = MLP, `*` = Attention, `T` = dense Transformer layer, and `#` = MoE layer. Quote YAML pattern strings that contain `#`.
 - For HF configs with `hybrid_override_pattern`, memory parameter estimates use layer-specific formulas by pattern. Runtime timing still comes from the preset profile keyed by `model.name`.
 - To add a new profiled model, add a new entry to `PRESETS` in `simpipe/models/registry.py` with either:
   - `pattern`, `forward_ms`, `backward_ms`, and optional `weight_ms`, or

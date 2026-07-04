@@ -1,10 +1,15 @@
 from simpipe.models.pattern import (
     ATTN,
+    MOE,
     MAMBA,
     MLP,
+    TRANSFORMER,
     encode_layer_pattern,
     layer_count,
+    layer_kinds,
+    normalize_timing_keys,
     normalize_timing_value,
+    pattern_tokens,
     stack_layer_count,
     stack_layer_symbols,
     tokenize_pattern,
@@ -18,15 +23,26 @@ def test_each_pattern_character_is_one_layer():
     assert stack_layer_symbols(_NEMOTRONH_PATTERN) == tokenize_pattern(_NEMOTRONH_PATTERN)
 
 
+def test_pattern_supports_transformer_and_moe_layers():
+    assert tokenize_pattern("T#") == [TRANSFORMER, MOE]
+    assert stack_layer_symbols("ET#L") == [TRANSFORMER, MOE]
+    assert pattern_tokens("ET#L") == ["E", TRANSFORMER, MOE, "L"]
+    assert layer_kinds("T#") == ["embedding", "transformer", "moe", "head"]
+    assert normalize_timing_keys({"transformer": 1, "moe": 2}) == {
+        TRANSFORMER: 1.0,
+        MOE: 2.0,
+    }
+
+
 def test_stage_layer_pattern_strings():
     from simpipe.models.pattern import stage_layer_pattern_strings
 
-    patterns = stage_layer_pattern_strings([1, 2, 1], ["M", "-", "*"])
-    assert patterns == ["EM", "-*", "L"]
+    patterns = stage_layer_pattern_strings([1, 2, 2], ["M", "-", "*", "T", "#"])
+    assert patterns == ["EM", "-*", "T#L"]
 
 
 def test_encode_layer_pattern_concatenates_symbols():
-    assert encode_layer_pattern([MAMBA, MLP, ATTN]) == "M-*"
+    assert encode_layer_pattern([MAMBA, MLP, ATTN, TRANSFORMER, MOE]) == "M-*T#"
 
 
 def test_normalize_timing_value_scales_fractional_ms():

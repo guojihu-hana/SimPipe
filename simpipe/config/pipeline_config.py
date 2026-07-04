@@ -57,7 +57,10 @@ def format_pipeline_config_yaml(
         f"placement: {_format_inline_nested_list(placement)}",
     ]
     if stage_layers is not None:
-        lines.append("stage_layers:  # stage_idx: layer pattern (E=embedding, M=mamba, -=mlp, *=attn, L=head)")
+        lines.append(
+            "stage_layers:  # stage_idx: layer pattern "
+            "(E=embedding, M=mamba, -=mlp, *=attn, T=transformer, #=moe, L=head)"
+        )
         lines.extend(f'- "{entry}"' for entry in _format_stage_layers(stage_layers))
     lines.extend(
         [
