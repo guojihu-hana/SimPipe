@@ -2,6 +2,7 @@ from simpipe.config.model import ModelConfig
 from simpipe.graph.model_graph import EMBEDDING_LAYER_IDX, ModelGraph, head_layer_idx
 from simpipe.models.registry import get_profile_times
 from simpipe.pipeline.partition import layer_partition_to_stage_specs
+import pytest
 
 
 def test_model_graph_includes_embedding_and_head():
@@ -59,3 +60,19 @@ def test_preset_exposes_embedding_and_head_profile_times():
     assert profile.head_f == 30.0
     assert profile.head_b == 35.0
     assert profile.head_w == 10.0
+
+
+def test_unprofiled_preset_uses_uniform_fallback_with_warning():
+    with pytest.warns(RuntimeWarning, match="No profiled layer times or pattern found"):
+        profile = get_profile_times("gpt-13B")
+
+    assert len(profile.layer_f) == 40
+    assert profile.layer_f == [1.0] * 40
+    assert profile.layer_b == [2.0] * 40
+    assert profile.layer_w == [0.0] * 40
+    assert profile.embedding_f == 0.0
+    assert profile.embedding_b == 0.0
+    assert profile.embedding_w == 0.0
+    assert profile.head_f == 0.0
+    assert profile.head_b == 0.0
+    assert profile.head_w == 0.0

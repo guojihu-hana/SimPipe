@@ -5,7 +5,9 @@ time_limit: 20000000
 
 model:
   # name: test_model
-  name: nemotronh-4B
+  # name: nemotronh-nano-v2-9B
+  # hf_config_path: simpipe/models/hf_configs/NemotronNanoV2-9B.json
+  name: gpt-13B
 
 parallel:
   pp_size: 4

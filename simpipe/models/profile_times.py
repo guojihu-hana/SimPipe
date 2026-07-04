@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import warnings
 
 from simpipe.models.pattern import (
     ATTN,
@@ -127,9 +128,33 @@ def profile_times_from_preset(preset: dict) -> ProfileTimes:
         )
 
     n = preset.get("model", {}).get("num_layers", 32)
-    f = preset.get("layer_f_times", [10.0] * n)
-    b = preset.get("layer_b_times", f)
-    w = preset.get("layer_w_times", b)
+    if "layer_f_times" in preset:
+        f = preset["layer_f_times"]
+        b = preset.get("layer_b_times", f)
+        w = preset.get("layer_w_times", b)
+    else:
+        model_name = preset.get("model", {}).get("name", "<unknown>")
+        warnings.warn(
+            f"No profiled layer times or pattern found for {model_name}; "
+            "using uniform fallback timings fwd=1.0, bwd=2.0, weight=0.0 per transformer layer "
+            "and embedding/head=0.0.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        f = [1.0] * n
+        b = [2.0] * n
+        w = [0.0] * n
+        return ProfileTimes(
+            layer_f=f,
+            layer_b=b,
+            layer_w=w,
+            embedding_f=0.0,
+            embedding_b=0.0,
+            embedding_w=0.0,
+            head_f=0.0,
+            head_b=0.0,
+            head_w=0.0,
+        )
     return ProfileTimes(
         layer_f=list(f),
         layer_b=list(b),
