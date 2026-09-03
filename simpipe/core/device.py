@@ -85,6 +85,8 @@ class Device:
             return None
         w = self._next_workload(time)
         if w and w.execute(time):
+            if self.runtime is not None:
+                self.runtime.on_workload_started(w)
             self.state = Device.BUSY
             self.current_workload = w
             self.last_wtype = w.wtype
@@ -106,6 +108,13 @@ class Device:
             while self.executable_workloads:
                 w = self.executable_workloads.pop()
                 if w and w.is_executable(time):
+                    if (
+                        w.wtype == WorkloadType.F
+                        and self.runtime is not None
+                        and self.runtime.f_admission_blocked(self.did, w.sid)
+                    ):
+                        not_ready_deferred.append(w)
+                        continue
                     if self._should_delay_for_overlap(time, w):
                         overlap_deferred.append(w)
                         continue

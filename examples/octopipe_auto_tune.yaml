@@ -19,8 +19,8 @@ schedule: octopipe
 
 tuning:
   auto_tune: true   # default for octopipe when partition/placement omitted
-  sim_k: 32          # full simulations on top-k fast-est candidates
-  beam_width: 32    # random placement variants per chunk size
+  sim_k: 64          # full simulations on top-k fast-est candidates
+  beam_width: 64    # random placement variants per chunk size
   bubble_overlap_tune: true
   bubble_overlap_max_iter: 4
   bubble_overlap_group_by: mid_type  # mid | mid_type | mid_sid_type

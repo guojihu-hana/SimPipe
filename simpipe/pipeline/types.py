@@ -26,6 +26,9 @@ class WorkloadPlan:
     layer_f_times: list[float] = field(default_factory=list)
     layer_b_times: list[float] = field(default_factory=list)
     layer_w_times: list[float] = field(default_factory=list)
+    # Transformer-layer count per stage (activation-memory weights); stage
+    # operator_ids are finer grained (~8 ops/layer) so cannot be used here.
+    layers_per_stage: list[int] | None = None
 
     @property
     def stage_num(self) -> int:

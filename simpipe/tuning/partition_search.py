@@ -58,6 +58,33 @@ def legal_chunk_values(num_layers: int, device_num: int, fixed_chunk: int | None
     return [c for c in range(max_chunk, 0, -1) if device_num * c <= num_layers]
 
 
+def legal_stage_nums(
+    num_layers: int,
+    device_num: int,
+    fixed_chunk: int | None = None,
+    *,
+    include_irregular: bool = False,
+    max_stage_num: int | None = None,
+    min_stage_num: int | None = None,
+) -> list[int]:
+    """Candidate total stage counts.
+
+    Regular mode keeps the historical behaviour (multiples of device_num).
+    Irregular mode enumerates every stage_num in [device_num, limit], so the
+    per-device stage count no longer has to be uniform (cf. the nemotron-nano
+    9B config with 24 stages on 4 devices placed as 7/6/6/5).
+    """
+    if fixed_chunk is not None:
+        stage_num = device_num * fixed_chunk
+        return [stage_num] if device_num <= stage_num <= num_layers else []
+    limit = num_layers if max_stage_num is None else min(num_layers, max_stage_num)
+    floor = device_num if min_stage_num is None else max(device_num, min_stage_num)
+    if include_irregular:
+        return list(range(limit, floor - 1, -1))
+    max_chunk = limit // device_num
+    return [device_num * c for c in range(max_chunk, 0, -1) if device_num * c >= floor]
+
+
 def top_partitions_by_stage_variance(
     layer_f: list[float],
     layer_b: list[float],

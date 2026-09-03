@@ -20,6 +20,7 @@ class FakeWorkload:
 def _device_with_queue(*workloads: FakeWorkload, started_backward: bool = True) -> Device:
     device = Device.__new__(Device)
     device.schedule_method = Schedule.OctoPipe
+    device.did = 0
     device.executable_workloads = OrderedQueue([WorkloadType.B, WorkloadType.F, WorkloadType.W])
     for workload in workloads:
         device.executable_workloads.push(workload)
@@ -34,6 +35,7 @@ def _device_with_queue(*workloads: FakeWorkload, started_backward: bool = True) 
         overlap_exempt_workloads=set(),
         overlap_exempt_group_by="mid_type",
         is_overlap_exempt=lambda workload: False,
+        f_admission_blocked=lambda did, sid: False,
     )
     return device
 

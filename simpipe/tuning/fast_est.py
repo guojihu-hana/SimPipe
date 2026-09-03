@@ -7,8 +7,11 @@ from simpipe.pipeline.placement import Placement
 
 
 def interleaved_placement(device_num: int, stage_num: int) -> list[list[int]]:
-    chunk = max(1, stage_num // device_num)
-    return [[i + device_num * j for j in range(chunk)] for i in range(device_num)]
+    """Round-robin stages over devices; handles stage_num % device_num != 0."""
+    placement: list[list[int]] = [[] for _ in range(device_num)]
+    for sid in range(stage_num):
+        placement[sid % device_num].append(sid)
+    return placement
 
 
 def _placement_key(placement: list[list[int]]) -> tuple[tuple[int, ...], ...]:
