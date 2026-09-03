@@ -39,7 +39,18 @@ def _load_run_inputs(config: str | None, model: str, schedule: str | None):
         cfg.schedule = schedule
     if not cfg.profiled_data:
         return cfg, None
-    return cfg, get_profile_times(cfg.model.name).slice_layers(cfg.model.num_layers)
+    if cfg.model.profile_times_path:
+        from simpipe.models.profile_times import profile_times_from_preset
+
+        data = yaml.safe_load(Path(cfg.model.profile_times_path).read_text())
+        pt = profile_times_from_preset(data).slice_layers(cfg.model.num_layers)
+        if cfg.model.recompute:
+            pt = pt.with_full_recompute()
+        return cfg, pt
+    pt = get_profile_times(cfg.model.name).slice_layers(cfg.model.num_layers)
+    if cfg.model.recompute:
+        pt = pt.with_full_recompute()
+    return cfg, pt
 
 
 @click.group()

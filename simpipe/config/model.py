@@ -20,7 +20,13 @@ class ModelConfig:
     top_k: int = 2
     expert_parallel_size: int = 1
     hf_config_path: str | None = None
+    # JSON with {"pattern": "E...L", "forward_ms": {...}, "backward_ms": {...},
+    # "weight_ms": {...}} (solver fit output); overrides registry presets.
+    profile_times_path: str | None = None
     flash_attention: bool = True
+    # Full activation recompute: backward re-runs forward first, so each
+    # checkpointed body layer costs f+b in the backward pass (emb/head excluded).
+    recompute: bool = False
 
     def __post_init__(self) -> None:
         if self.hf_config_path:

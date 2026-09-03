@@ -28,6 +28,20 @@ class ProfileTimes:
     head_b: float | None = None
     head_w: float | None = None
 
+    def with_full_recompute(self) -> "ProfileTimes":
+        """Model --recompute-granularity full: b ops re-run the layer forward."""
+        return ProfileTimes(
+            layer_f=self.layer_f,
+            layer_b=[f + b for f, b in zip(self.layer_f, self.layer_b)],
+            layer_w=self.layer_w,
+            embedding_f=self.embedding_f,
+            embedding_b=self.embedding_b,
+            embedding_w=self.embedding_w,
+            head_f=self.head_f,
+            head_b=self.head_b,
+            head_w=self.head_w,
+        )
+
     def slice_layers(self, num_layers: int) -> ProfileTimes:
         return ProfileTimes(
             layer_f=self.layer_f[:num_layers],
