@@ -6,7 +6,7 @@ time_limit: 20000000
 
 model:
   # name: test_model
-  name: nemotronh-4B
+  name: nemotron-h-4B
 
 parallel:
   pp_size: 4

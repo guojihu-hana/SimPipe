@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from simpipe.config.sim_config import SimConfig
@@ -15,6 +16,7 @@ from simpipe.tuning.fast_est import (
 )
 from simpipe.tuning.partition_search import (
     legal_chunk_values,
+    legal_stage_nums,
     partition_variance,
     stage_times_for_partition,
     top_partitions_by_stage_variance,
@@ -83,7 +85,9 @@ def _evaluate_candidate(
     overlap_exempt: set[tuple] = set()
     trials: list = []
 
-    def run_simulation(exemptions: set[tuple] | None = None) -> tuple[float, list[dict]]:
+    def run_simulation(
+        exemptions: set[tuple] | None = None,
+    ) -> tuple[float, list[dict], float]:
         executor = build_simulation(
             config,
             layer_f_times=layer_f_times,
@@ -102,12 +106,14 @@ def _evaluate_candidate(
             overlap_exempt_group_by=tuning.bubble_overlap_group_by,
         )
         result = executor.run()
-        return result.makespan, result.records
+        if result.stalled:
+            return float("inf"), result.records, result.peak_inflight_layers
+        return result.makespan, result.records, result.peak_inflight_layers
 
     if tuning.bubble_overlap_tune:
 
         def run_with_exemptions(exemptions: set[tuple]) -> list[dict]:
-            _makespan, records = run_simulation(exemptions)
+            _makespan, records, _peak = run_simulation(exemptions)
             return records
 
         initial_records = run_with_exemptions(set())
@@ -119,12 +125,22 @@ def _evaluate_candidate(
         )
         overlap_exempt = tune_result.exemptions
         trials = tune_result.trials
-        makespan, records = run_simulation(overlap_exempt)
+        makespan, records, peak_inflight = run_simulation(overlap_exempt)
     else:
-        makespan, records = run_simulation(None)
+        makespan, records, peak_inflight = run_simulation(None)
 
     stats = analyze_pipeline_comp_bubble(records, device_num=config.parallel.pp_size)
+    if math.isinf(makespan):
+        # Simulation stalled (schedule cannot make progress under the
+        # activation cap); treat as infeasible rather than grinding on.
+        return float("inf"), records, overlap_exempt, trials, stats.to_dict(), float("inf")
     score = tuning_score(stats, makespan)
+    if tuning.max_inflight_layers:
+        # Runtime-tracked per-device peak (record-based accounting would
+        # double count DP replicas, which share device ids in the records).
+        if peak_inflight > tuning.max_inflight_layers:
+            # Would OOM on real hardware: too many concurrent activations.
+            return float("inf"), records, overlap_exempt, trials, stats.to_dict(), float("inf")
     return makespan, records, overlap_exempt, trials, stats.to_dict(), score
 
 
@@ -156,11 +172,17 @@ def tune_octopipe(
     )
 
     fixed_chunk = config.parallel.chunk_num
-    chunks = legal_chunk_values(config.model.num_layers, pp.device_num, fixed_chunk)
+    stage_nums = legal_stage_nums(
+        config.model.num_layers,
+        pp.device_num,
+        fixed_chunk,
+        include_irregular=tuning.irregular_stage_num,
+        max_stage_num=tuning.max_stage_num,
+        min_stage_num=tuning.min_stage_num,
+    )
     pending_jobs: list[tuple[float, tuple[float, int, float], list[int], list[list[int]], int, bool]] = []
 
-    for chunk in chunks:
-        stage_num = pp.device_num * chunk
+    for stage_num in stage_nums:
         partitions = top_partitions_by_stage_variance(
             layer_f_times,
             layer_b_times,
@@ -175,6 +197,9 @@ def tune_octopipe(
             head_b_time=emb[4],
             head_w_time=emb[5],
         )
+        # Per-stage runtime overhead (f+b+w workloads), in ticks, so the proxy
+        # ranking does not systematically favor many-stage partitions.
+        stage_overhead = 3.0 * config.hardware.workload_overhead_ms * 100.0
         for part_variance, partition in partitions:
             stage_times = stage_times_for_partition(
                 layer_f_times,
@@ -188,6 +213,8 @@ def tune_octopipe(
                 head_b_time=emb[4],
                 head_w_time=emb[5],
             )
+            if stage_overhead > 0:
+                stage_times = [t + stage_overhead for t in stage_times]
             placements = generate_octopipe_placement_candidates(
                 pp.device_num,
                 stage_num,
@@ -196,7 +223,7 @@ def tune_octopipe(
             )
             interleaved = placements[0]
             pending_jobs.append(
-                (part_variance, placement_proxy_score(interleaved, stage_times), partition, interleaved, chunk, True)
+                (part_variance, placement_proxy_score(interleaved, stage_times), partition, interleaved, stage_num, True)
             )
             for placement in placements[1:]:
                 pending_jobs.append(
@@ -205,7 +232,7 @@ def tune_octopipe(
                         placement_proxy_score(placement, stage_times),
                         partition,
                         placement,
-                        chunk,
+                        stage_num,
                         False,
                     )
                 )
@@ -216,11 +243,12 @@ def tune_octopipe(
     candidates: list[TuneCandidateAnalysis] = []
     seen: set[tuple[tuple[int, ...], tuple[tuple[int, ...], ...]]] = set()
 
-    for part_variance, _proxy, partition, placement, chunk, _is_interleaved in eval_jobs:
+    for part_variance, _proxy, partition, placement, stage_num, _is_interleaved in eval_jobs:
         key = (tuple(partition), _placement_key(placement))
         if key in seen:
             continue
         seen.add(key)
+        chunk = -(-stage_num // pp.device_num)  # ceil: max stages on any device
         stage_times = stage_times_for_partition(
             layer_f_times,
             layer_b_times,
@@ -268,6 +296,11 @@ def tune_octopipe(
         raise RuntimeError("OctoPipe tuning produced no candidates")
 
     candidates.sort(key=lambda c: c.makespan)
+    if candidates[0].makespan == float("inf"):
+        raise RuntimeError(
+            "OctoPipe tuning: every candidate exceeds max_inflight_layers="
+            f"{tuning.max_inflight_layers}; raise the cap or reduce microbatches"
+        )
     top_k = min(tuning.result_top_k, len(candidates))
     top_results: list[TuneCandidateAnalysis] = []
     for rank, candidate in enumerate(candidates[:top_k], start=1):

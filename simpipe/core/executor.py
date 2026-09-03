@@ -29,6 +29,8 @@ class SimulationResult:
     records: list[dict]
     idle_per_device: list[float]
     memory: PipelineMemoryEstimate | None = None
+    stalled: bool = False
+    peak_inflight_layers: float = 0.0
 
 
 class Executor:
@@ -102,6 +104,11 @@ class Executor:
             records=all_records,
             idle_per_device=idle,
             memory=memory,
+            stalled=any(getattr(p, "stall_flag", False) for p in self.pipelines),
+            peak_inflight_layers=max(
+                (getattr(p, "peak_inflight_layers", 0) for p in self.pipelines),
+                default=0,
+            ),
         )
 
 
@@ -208,6 +215,7 @@ def build_simulation(
         head_b_time,
         head_w_time,
     )
+    plan.layers_per_stage = list(partition_layers)
     executor = Executor(
         config,
         graph,

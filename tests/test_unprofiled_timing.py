@@ -24,7 +24,7 @@ def test_yaml_configs_do_not_use_profiled_data_by_default(tmp_path):
     cfg_path.write_text(
         """
 model:
-  name: nemotronh-4B
+  name: nemotron-h-4B
   num_layers: 4
   hidden_size: 256
   num_attention_heads: 4
@@ -39,7 +39,7 @@ schedule: octopipe
 
     from simpipe.cli import _load_run_inputs
 
-    cfg, profile = _load_run_inputs(str(cfg_path), "nemotronh-4B", None)
+    cfg, profile = _load_run_inputs(str(cfg_path), "nemotron-h-4B", None)
 
     assert cfg.profiled_data is False
     assert profile is None
@@ -62,7 +62,7 @@ schedule: octopipe
 
     from simpipe.cli import _load_run_inputs
 
-    cfg, profile = _load_run_inputs(str(cfg_path), "nemotronh-4B", None)
+    cfg, profile = _load_run_inputs(str(cfg_path), "nemotron-h-4B", None)
 
     assert cfg.model.name == "test_model"
     assert cfg.model.num_layers == 48

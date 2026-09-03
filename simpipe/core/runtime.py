@@ -43,6 +43,33 @@ class PipelineRuntime:
         self.workload_execute_record: list[list[Workload]] = [
             [] for _ in range(self.device_num)
         ]
+        # Activation-memory admission control: block F launches that would
+        # push a device's in-flight activations (layer*microbatch; allocated
+        # at F start, freed when B and W both finish) over the cap.  The
+        # emitted schedule then keeps the same bound on real hardware.
+        tuning = getattr(getattr(executor, "config", None), "tuning", None)
+        self.max_inflight_layers = getattr(tuning, "max_inflight_layers", None) or 0
+        if plan.layers_per_stage:
+            self._stage_layer_weight = {
+                i: max(1, n) for i, n in enumerate(plan.layers_per_stage)
+            }
+        else:
+            self._stage_layer_weight = {
+                i: max(1, len(stage.operator_ids))
+                for i, stage in enumerate(plan.partition.stages)
+            }
+        self._inflight_layers = [0] * self.device_num
+        self._act_pending: dict[tuple, list] = {}
+        # Deadlock-free admission with reservations: a bare device-level cap
+        # can deadlock (early stages hog the budget, blocking the F chain the
+        # first B depends on).  Instead, one microbatch slot per stage is
+        # reserved so the mid-0 F chain always completes; the remaining
+        # budget is shared freely across the device's stages (uneven
+        # distribution allowed, unlike a uniform per-stage quota).
+        self._stage_inflight_mb: dict[int, int] = {}
+        self.stall_flag = False
+        self._last_progress_time = self.time
+        self.peak_inflight_layers = 0
         self._init_devices()
         self._init_dynamic_ready_queues()
         self.num_finished = 0
@@ -74,7 +101,13 @@ class PipelineRuntime:
                 self.finish_flag = True
 
     def _init_devices(self) -> None:
+        from dataclasses import replace as dc_replace
+
         placement = self.plan.placement.device_stages
+        # Profiled timings are in 0.01 ms ticks; the empirical overheads below
+        # are given in ms and converted here.
+        overhead = self.hardware.workload_overhead_ms * 100.0
+        comm_time = self.hardware.comm_alpha_us / 1000.0 + self.hardware.p2p_latency_ms * 100.0
         for did in range(self.device_num):
             dev = Device(
                 device_idx=did,
@@ -82,11 +115,19 @@ class PipelineRuntime:
                 mid_offset=self.mid_offset,
                 comp_power=self.hardware.comp_power,
                 max_mem=self.hardware.gpu_hbm_gb,
-                comm_time=self.hardware.comm_alpha_us / 1000.0,
+                comm_time=comm_time,
                 runtime=self,
             )
             for sid in placement[did]:
-                dev.add_stage(sid, self.plan.timing_for_stage(sid))
+                timing = self.plan.timing_for_stage(sid)
+                if overhead > 0:
+                    timing = dc_replace(
+                        timing,
+                        f_time=timing.f_time + overhead,
+                        b_time=timing.b_time + overhead,
+                        w_time=timing.w_time + overhead if timing.w_time > 0 else timing.w_time,
+                    )
+                dev.add_stage(sid, timing)
             self.devices.append(dev)
 
     def _init_dynamic_ready_queues(self) -> None:
@@ -95,6 +136,62 @@ class PipelineRuntime:
         for device in self.devices:
             for workload in device.get_initial_executable_workload(self.time):
                 device.push_executable_workload(workload, self.time)
+
+    def f_admission_blocked(self, did: int, sid: int) -> bool:
+        if not self.max_inflight_layers:
+            return False
+        weight = self._stage_layer_weight.get(sid, 1)
+        # First in-flight microbatch of a stage draws from its reservation:
+        # admit whenever the raw cap allows, so the mid-0 chain never stalls.
+        if self._stage_inflight_mb.get(sid, 0) == 0:
+            return self._inflight_layers[did] + weight > self.max_inflight_layers
+        # Additional microbatches must leave the reservations of this
+        # device's still-empty stages untouched.
+        reserved = sum(
+            self._stage_layer_weight.get(s, 1)
+            for s in self.plan.placement.device_stages[did]
+            if self._stage_inflight_mb.get(s, 0) == 0
+        )
+        return (
+            self._inflight_layers[did] + weight + reserved
+            > self.max_inflight_layers
+        )
+
+    def on_workload_started(self, workload: Workload) -> None:
+        if not self.max_inflight_layers or workload.wtype != WorkloadType.F:
+            return
+        sid = workload.sid
+        did = self.sid_to_did(sid)
+        weight = self._stage_layer_weight.get(sid, 1)
+        self._inflight_layers[did] += weight
+        self._stage_inflight_mb[sid] = self._stage_inflight_mb.get(sid, 0) + 1
+        if self._inflight_layers[did] > self.peak_inflight_layers:
+            self.peak_inflight_layers = self._inflight_layers[did]
+        stage = self.devices[did].stages.get(sid)
+        expected = 1
+        if stage is not None:
+            wmap = stage.workloads.get(WorkloadType.W)
+            if wmap and workload.mid in wmap:
+                expected = 2
+        self._act_pending[(sid, workload.mid)] = [expected, did, weight]
+
+    def _on_activation_consumer_finished(self, workload: Workload) -> None:
+        if not self.max_inflight_layers or workload.wtype not in (
+            WorkloadType.B,
+            WorkloadType.W,
+        ):
+            return
+        key = (workload.sid, workload.mid)
+        entry = self._act_pending.get(key)
+        if entry is None:
+            return
+        entry[0] -= 1
+        if entry[0] <= 0:
+            del self._act_pending[key]
+            self._inflight_layers[entry[1]] -= entry[2]
+            self._stage_inflight_mb[workload.sid] = max(
+                0, self._stage_inflight_mb.get(workload.sid, 0) - 1
+            )
 
     def sid_to_did(self, sid: int) -> int:
         for did, sids in enumerate(self.plan.placement.device_stages):
@@ -132,6 +229,7 @@ class PipelineRuntime:
             if w.state == Workload.finished:
                 device.state = Device.IDLE
                 self.num_finished += 1
+                self._on_activation_consumer_finished(w)
                 self._propagate_constraints(w, time)
                 device.current_workload = None
 
@@ -143,19 +241,42 @@ class PipelineRuntime:
         for device in self.devices:
             device.execute_workload(time)
 
+    # No single workload takes anywhere near this long (ticks are 0.01 ms,
+    # so this is 2 s of simulated time); exceeding it without finishing any
+    # workload means the schedule is stuck, not slow.
+    STALL_WINDOW = 200_000
+
+    def _stalled(self) -> bool:
+        if self.time - self._last_progress_time <= self.STALL_WINDOW:
+            return False
+        self.stall_flag = True
+        return True
+
     def run(self, time_limit: int) -> int:
+        last_finished = self.num_finished
         while self.time <= time_limit and not self.finish_flag:
             self.check_workload_status(self.time)
             self.execute_workload(self.time)
             self.check_device_status(self.time)
+            if self.num_finished != last_finished:
+                last_finished = self.num_finished
+                self._last_progress_time = self.time
+            elif self._stalled():
+                break
             self.time += 1
         return self.time
 
     def run_discrete(self, time_limit: int) -> int:
+        last_finished = self.num_finished
         while self.time <= time_limit and not self.finish_flag:
             self.check_workload_status(self.time)
             self.execute_workload(self.time)
             self.check_device_status(self.time)
+            if self.num_finished != last_finished:
+                last_finished = self.num_finished
+                self._last_progress_time = self.time
+            elif self._stalled():
+                break
             next_t = self._next_tick(time_limit)
             if next_t <= self.time:
                 self.time += 1

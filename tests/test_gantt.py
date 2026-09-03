@@ -51,7 +51,8 @@ def test_gantt_min_workload_px_is_minimum_visible_block_width(tmp_path):
     widths = [
         float(w)
         for w in re.findall(
-            r'<rect x="[0-9.]+" y="[0-9.]+" width="([0-9.]+)".*fill="#(?:E8C66A|94B8E8|8FBD8C)"',
+            # rx="2" selects workload blocks; the legend swatches use rx="1".
+            r'<rect x="[0-9.]+" y="[0-9.]+" width="([0-9.]+)"[^>]*fill="#(?:E8C66A|94B8E8|8FBD8C)"[^>]*rx="2"',
             out.read_text(),
         )[:3]
     ]
