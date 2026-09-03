@@ -1,61 +1,27 @@
 from __future__ import annotations
 
+import json
+from functools import lru_cache
+from pathlib import Path
+
 from simpipe.config.sim_config import SimConfig
 from simpipe.models.pattern import stack_layer_count, stack_layer_symbols
 from simpipe.models.profile_times import ProfileTimes, profile_times_from_preset
 
-_NEMOTRONH_FORWARD_MS = {
-    "E": 2.564743408403899,
-    "M": 2.734447820687338,  # mamba
-    "-": 1.6631777588932555,  # mlp
-    "*": 2.342341311290737,  # attn
-    "L": 12.715130125848873,
-}
-_NEMOTRONH_BACKWARD_MS = {
-    "E": 2.695218854201464,
-    "M": 6.950846335235035,  # mamba
-    "-": 2.2246038983742937,  # mlp
-    "*": 1.8680110522756872,  # attn
-    "L": 11.092865020350409,
-}
-_NEMOTRONH_PATTERN = "M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-"
-
-_NEMOTRON_NANO_V2_F_MS = {
-    "E": 0.7589,
-    "M": 2.6768,  # mamba
-    "-": 1.8477,  # mlp
-    "*": 1.9254,  # attn
-    "L": 14.2155,
-}
-_NEMOTRON_NANO_V2_B_MS = {
-    "E": 2.8654,
-    "M": 4.2984,  # mamba
-    "-": 1.9090,  # mlp
-    "*": 2.4534,  # attn
-    "L": 15.7056,
-}
-_NEMOTRON_NANO_V2_W_MS = {
-    "E": 0,
-    "M": 1.7599,  # mamba
-    "-": 1.6866,  # mlp
-    "*": 0.6547,  # attn
-    "L": 0.0595,
-}
-
-_NEMOTRON_NANO_V2_PATTERN = "M-M-M-MM-M-M-M*-M-M-M*-M-M-M-M*-M-M-M-M*-M-MM-M-M-M-M-M-"
+# Fitted per-model layer times (pattern + per-symbol f/b/w ms) live in
+# profiles/<name>.json at the repository root; PRESETS below only carries
+# model metadata and synthetic test fixtures.
+PROFILES_DIR = Path(__file__).resolve().parents[2] / "profiles"
 
 PRESETS: dict[str, dict] = {
-    "nemotronh-4B": {
+    "nemotron-h-4B": {
         "model": {
-            "name": "nemotronh-4B",
+            "name": "nemotron-h-4B",
             "hidden_size": 3072,
             "num_attention_heads": 32,
             "seq_len": 4096,
             "vocab_size": 131072,
         },
-        "pattern": _NEMOTRONH_PATTERN,
-        "forward_ms": _NEMOTRONH_FORWARD_MS,
-        "backward_ms": _NEMOTRONH_BACKWARD_MS,
     },
     "nemotron-nano-v2-9B": {
         "model": {
@@ -65,10 +31,15 @@ PRESETS: dict[str, dict] = {
             "seq_len": 4096,
             "vocab_size": 131072,
         },
-        "pattern": _NEMOTRON_NANO_V2_PATTERN,
-        "forward_ms": _NEMOTRON_NANO_V2_F_MS,
-        "backward_ms": _NEMOTRON_NANO_V2_B_MS,
-        "weight_ms": _NEMOTRON_NANO_V2_W_MS,
+    },
+    "nemotron-h-47B": {
+        "model": {
+            "name": "nemotron-h-47B",
+            "hidden_size": 8192,
+            "num_attention_heads": 64,
+            "seq_len": 4096,
+            "vocab_size": 131072,
+        },
     },
     "test_model": {
         "model": {
@@ -111,6 +82,29 @@ PRESETS: dict[str, dict] = {
 }
 
 
+@lru_cache(maxsize=None)
+def profile_data(name: str) -> dict | None:
+    """Fitted timing data for a model (pattern + per-symbol f/b/w ms), if any."""
+    path = PROFILES_DIR / f"{name}.json"
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text())
+
+
+def profiled_model_names() -> list[str]:
+    """Names of all models with a profiles/<name>.json timing file."""
+    return sorted(path.stem for path in PROFILES_DIR.glob("*.json"))
+
+
+def _timing_data(name: str) -> dict:
+    """Preset metadata merged with the profiles/ JSON timing data (JSON wins)."""
+    data = dict(PRESETS.get(name, {}))
+    profile = profile_data(name)
+    if profile:
+        data.update(profile)
+    return data
+
+
 def _model_data_from_preset(data: dict) -> dict:
     model_data = dict(data.get("model", {}))
     if "pattern" in data and "num_layers" not in model_data:
@@ -121,20 +115,20 @@ def _model_data_from_preset(data: dict) -> dict:
 def preset_model_data(name: str) -> dict:
     if name not in PRESETS:
         raise KeyError(f"Unknown model preset: {name}")
-    return _model_data_from_preset(PRESETS[name])
+    return _model_data_from_preset(_timing_data(name))
 
 
 def stack_layer_symbols_for_model(name: str, num_layers: int) -> list[str] | None:
-    preset = PRESETS.get(name)
-    if not preset or "pattern" not in preset:
+    pattern = _timing_data(name).get("pattern")
+    if not pattern:
         return None
-    return stack_layer_symbols(preset["pattern"])[:num_layers]
+    return stack_layer_symbols(pattern)[:num_layers]
 
 
 def get_preset(name: str) -> SimConfig:
     if name not in PRESETS:
         raise KeyError(f"Unknown model preset: {name}")
-    data = PRESETS[name]
+    data = _timing_data(name)
     return SimConfig.from_dict(
         {
             "model": _model_data_from_preset(data),
@@ -144,8 +138,7 @@ def get_preset(name: str) -> SimConfig:
 
 
 def get_profile_times(name: str) -> ProfileTimes:
-    preset = PRESETS.get(name, {})
-    return profile_times_from_preset(preset)
+    return profile_times_from_preset(_timing_data(name))
 
 
 def get_layer_times(name: str) -> tuple[list[float], list[float], list[float]]:

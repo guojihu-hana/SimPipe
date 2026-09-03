@@ -14,13 +14,19 @@ from simpipe.models.pattern import (
     stack_layer_symbols,
     tokenize_pattern,
 )
-from simpipe.models.registry import _NEMOTRONH_PATTERN, get_preset, get_profile_times
+from simpipe.models.registry import get_preset, get_profile_times, profile_data
+
+NEMOTRON_H_4B_PATTERN = profile_data("nemotron-h-4B")["pattern"]
+NEMOTRON_NANO_V2_PATTERN = profile_data("nemotron-nano-v2-9B")["pattern"]
 
 
 def test_each_pattern_character_is_one_layer():
     assert tokenize_pattern("M-M*") == [MAMBA, MLP, MAMBA, ATTN]
     assert stack_layer_symbols("M-M*") == [MAMBA, MLP, MAMBA, ATTN]
-    assert stack_layer_symbols(_NEMOTRONH_PATTERN) == tokenize_pattern(_NEMOTRONH_PATTERN)
+    # The nano pattern spells out no E/L, so stack symbols == all tokens.
+    assert stack_layer_symbols(NEMOTRON_NANO_V2_PATTERN) == tokenize_pattern(
+        NEMOTRON_NANO_V2_PATTERN
+    )
 
 
 def test_pattern_supports_transformer_and_moe_layers():
@@ -53,45 +59,39 @@ def test_normalize_timing_value_scales_fractional_ms():
 
 
 def test_nemotronh_pattern_layer_count():
-    assert stack_layer_count(_NEMOTRONH_PATTERN) == 52
-    assert layer_count(_NEMOTRONH_PATTERN) == 54
+    assert stack_layer_count(NEMOTRON_H_4B_PATTERN) == 52
+    assert layer_count(NEMOTRON_H_4B_PATTERN) == 54
 
 
 def test_nemotronh_stack_layer_mix():
-    stack = stack_layer_symbols(_NEMOTRONH_PATTERN)
+    stack = stack_layer_symbols(NEMOTRON_H_4B_PATTERN)
     assert stack.count(MAMBA) == 24
     assert stack.count(MLP) == 24
     assert stack.count(ATTN) == 4
 
 
 def test_nemotronh_profile_times_match_pattern():
-    profile = get_profile_times("nemotronh-4B")
+    profile = get_profile_times("nemotron-h-4B")
 
     assert len(profile.layer_f) == 52
-    assert profile.layer_f[0] == 273
-    assert profile.layer_f[1] == 166
-    assert profile.layer_f[7] == 234
-    assert profile.embedding_f == 256
-    assert profile.head_f == 1272
-    assert profile.embedding_w == 270
+    assert profile.layer_f[0] == 109
+    assert profile.layer_f[1] == 67
+    assert profile.layer_f[7] == 51
+    assert profile.embedding_f == 278
+    assert profile.head_f == 964
+    assert profile.embedding_w == 0.0
 
 
 def test_get_preset_derives_num_layers_from_pattern():
-    cfg = get_preset("nemotronh-4B")
+    cfg = get_preset("nemotron-h-4B")
     assert cfg.model.num_layers == 52
-    assert layer_count(_NEMOTRONH_PATTERN) == 54
+    assert layer_count(NEMOTRON_H_4B_PATTERN) == 54
 
 
 def test_nemotron_nano_v2_profile_times_use_weight_ms():
-    from simpipe.models.registry import (
-        _NEMOTRON_NANO_V2_PATTERN,
-        get_preset,
-        get_profile_times,
-    )
-
     profile = get_profile_times("nemotron-nano-v2-9B")
 
-    assert stack_layer_count(_NEMOTRON_NANO_V2_PATTERN) == 56
+    assert stack_layer_count(NEMOTRON_NANO_V2_PATTERN) == 56
     assert len(profile.layer_w) == 56
     assert profile.layer_w[0] == 176
     assert profile.layer_w[1] == 169

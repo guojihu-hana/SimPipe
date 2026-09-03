@@ -60,7 +60,7 @@ def main() -> None:
 
 @main.command("run")
 @click.option("--config", type=click.Path(exists=True), default=None)
-@click.option("--model", default="nemotronh-4B")
+@click.option("--model", default="nemotron-h-4B")
 @click.option("--schedule", default=None, help="Override schedule from config (default: use config or 1f1b)")
 @click.option("--output", type=click.Path(), default="./results")
 @click.option(

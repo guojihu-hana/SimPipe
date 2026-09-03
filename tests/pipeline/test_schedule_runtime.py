@@ -31,8 +31,8 @@ def _build_with_preset(cfg, model_name: str, **kwargs):
 
 
 def test_zbh_executes_all_workloads_including_w():
-    cfg = _preset_cfg("nemotronh-4B")
-    ex = _build_with_preset(cfg, "nemotronh-4B", schedule=parse_schedule("zbh"))
+    cfg = _preset_cfg("nemotron-h-4B")
+    ex = _build_with_preset(cfg, "nemotron-h-4B", schedule=parse_schedule("zbh"))
     assert ex.config.parallel.bwd_split is True
     result = ex.run()
     types = [r["wtype"] for r in result.records]
@@ -44,10 +44,18 @@ def test_zbh_executes_all_workloads_including_w():
 
 
 def test_profiled_layer_times_fall_back_to_backward_for_w():
-    _f, b, w = get_layer_times("nemotronh-4B")
+    from simpipe.models.profile_times import profile_times_from_preset
 
-    assert w == b
-    assert all(t > 0 for t in w)
+    profile = profile_times_from_preset(
+        {
+            "pattern": "ETTL",
+            "forward_ms": {"E": 1.0, "T": 2.0, "L": 3.0},
+            "backward_ms": {"E": 2.0, "T": 4.0, "L": 6.0},
+        }
+    )
+
+    assert profile.layer_w == profile.layer_b
+    assert all(t > 0 for t in profile.layer_w)
 
 
 def test_test_model_preset_has_48_layers():
@@ -98,7 +106,7 @@ def test_octopipe_auto_tune_can_add_bubble_overlap_exemptions():
 
 
 def test_interleaved_default_chunk_is_max():
-    cfg = _preset_cfg("nemotronh-4B")
+    cfg = _preset_cfg("nemotron-h-4B")
     cfg = apply_schedule_config(cfg, Schedule.INTERLEAVED)
     layers = resolve_partition_layers(cfg, Schedule.INTERLEAVED, None)
     assert cfg.parallel.chunk_num == 13
@@ -110,7 +118,7 @@ def test_interleaved_default_chunk_is_max():
 def test_interleaved_respects_manual_chunk_num():
     from dataclasses import replace
 
-    cfg = _preset_cfg("nemotronh-4B")
+    cfg = _preset_cfg("nemotron-h-4B")
     cfg = replace(cfg, parallel=replace(cfg.parallel, chunk_num=2))
     cfg = apply_schedule_config(cfg, Schedule.INTERLEAVED)
     layers = resolve_partition_layers(cfg, Schedule.INTERLEAVED, None)
@@ -123,7 +131,7 @@ def test_interleaved_respects_manual_chunk_num():
 def test_octopipe_respects_chunk_num():
     from dataclasses import replace
 
-    cfg = _preset_cfg("nemotronh-4B")
+    cfg = _preset_cfg("nemotron-h-4B")
     cfg = replace(cfg, model=replace(cfg.model, num_layers=48), schedule="octopipe")
     cfg = replace(cfg, parallel=replace(cfg.parallel, chunk_num=2), tuning=TuningConfig(auto_tune=False))
     cfg = apply_schedule_config(cfg, Schedule.OctoPipe)
@@ -131,7 +139,7 @@ def test_octopipe_respects_chunk_num():
     layers = resolve_partition_layers(cfg, Schedule.OctoPipe, None)
     assert len(layers) == 8
     assert sum(layers) == 48
-    ex = _build_with_preset(cfg, "nemotronh-4B", schedule=parse_schedule("octopipe"))
+    ex = _build_with_preset(cfg, "nemotron-h-4B", schedule=parse_schedule("octopipe"))
     assert ex.plan.stage_num == 8
     assert ex.plan.placement.device_stages == [[0, 4], [1, 5], [2, 6], [3, 7]]
     ex.run()
@@ -140,10 +148,10 @@ def test_octopipe_respects_chunk_num():
 def test_octopipe_initializes_dynamic_ready_queues():
     from dataclasses import replace
 
-    cfg = _preset_cfg("nemotronh-4B")
+    cfg = _preset_cfg("nemotron-h-4B")
     cfg = replace(cfg, model=replace(cfg.model, num_layers=8), schedule="octopipe")
     cfg = replace(cfg, parallel=replace(cfg.parallel, chunk_num=2), tuning=TuningConfig(auto_tune=False))
-    ex = _build_with_preset(cfg, "nemotronh-4B", schedule=parse_schedule("octopipe"))
+    ex = _build_with_preset(cfg, "nemotron-h-4B", schedule=parse_schedule("octopipe"))
 
     assert ex.plan.static_schedule is None
     assert bool(ex.pipelines[0].devices[0].executable_workloads)
@@ -152,10 +160,10 @@ def test_octopipe_initializes_dynamic_ready_queues():
 def test_octopipe_completes_all_dynamic_workloads():
     from dataclasses import replace
 
-    cfg = _preset_cfg("nemotronh-4B")
+    cfg = _preset_cfg("nemotron-h-4B")
     cfg = replace(cfg, model=replace(cfg.model, num_layers=8), schedule="octopipe")
     cfg = replace(cfg, parallel=replace(cfg.parallel, chunk_num=2), tuning=TuningConfig(auto_tune=False))
-    ex = _build_with_preset(cfg, "nemotronh-4B", schedule=parse_schedule("octopipe"))
+    ex = _build_with_preset(cfg, "nemotron-h-4B", schedule=parse_schedule("octopipe"))
 
     result = ex.run(time_limit=100_000)
     assert len(result.records) == 8 * cfg.parallel.micro_batch_num * 2
@@ -222,11 +230,11 @@ def test_bapar_uses_dp_partition_and_1f1b_scheduling():
 def test_1f1b_ignores_yaml_chunk_num():
     from dataclasses import replace
 
-    cfg = _preset_cfg("nemotronh-4B")
+    cfg = _preset_cfg("nemotron-h-4B")
     cfg = replace(cfg, parallel=replace(cfg.parallel, chunk_num=2), schedule="1f1b")
     cfg = apply_schedule_config(cfg, Schedule.S1F1B)
     assert cfg.parallel.chunk_num == 1
-    ex = _build_with_preset(cfg, "nemotronh-4B", schedule=parse_schedule("1f1b"))
+    ex = _build_with_preset(cfg, "nemotron-h-4B", schedule=parse_schedule("1f1b"))
     assert ex.plan.stage_num == 4
     assert ex.plan.placement.device_stages == [[0], [1], [2], [3]]
 
@@ -234,9 +242,9 @@ def test_1f1b_ignores_yaml_chunk_num():
 def test_interleaved_manual_chunk_runs():
     from dataclasses import replace
 
-    cfg = _preset_cfg("nemotronh-4B")
+    cfg = _preset_cfg("nemotron-h-4B")
     cfg = replace(cfg, parallel=replace(cfg.parallel, chunk_num=2))
-    ex = _build_with_preset(cfg, "nemotronh-4B", schedule=parse_schedule("interleaved"))
+    ex = _build_with_preset(cfg, "nemotron-h-4B", schedule=parse_schedule("interleaved"))
     assert ex.plan.stage_num == 8
     assert ex.config.parallel.chunk_num == 2
     result = ex.run()
@@ -267,8 +275,8 @@ def test_interleaved_schedule_length_matches_ps():
 
 
 def test_interleaved_runs_all_static_ops():
-    cfg = _preset_cfg("nemotronh-4B")
-    ex = _build_with_preset(cfg, "nemotronh-4B", schedule=parse_schedule("interleaved"))
+    cfg = _preset_cfg("nemotron-h-4B")
+    ex = _build_with_preset(cfg, "nemotron-h-4B", schedule=parse_schedule("interleaved"))
     assert ex.plan.stage_num == 52
     static_len = sum(len(row) for row in ex.plan.static_schedule)
     result = ex.run()

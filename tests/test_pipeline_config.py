@@ -140,7 +140,7 @@ def test_build_pipeline_config_from_executor_includes_stage_layers(tmp_path):
     from simpipe.core.executor import build_simulation
     from simpipe.models.registry import get_preset, get_profile_times
 
-    cfg = get_preset("nemotronh-4B")
+    cfg = get_preset("nemotron-h-4B")
     cfg = replace(
         cfg,
         schedule="octopipe",
@@ -150,7 +150,7 @@ def test_build_pipeline_config_from_executor_includes_stage_layers(tmp_path):
         partition_layers=[13, 13, 13, 13, 13, 13, 13, 13],
         placement=[[0, 4], [1, 5], [2, 6], [3, 7]],
     )
-    profile = get_profile_times("nemotronh-4B").slice_layers(cfg.model.num_layers)
+    profile = get_profile_times("nemotron-h-4B").slice_layers(cfg.model.num_layers)
     executor = build_simulation(
         cfg,
         profile.layer_f,
