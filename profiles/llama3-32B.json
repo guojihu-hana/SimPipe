@@ -1,0 +1,18 @@
+{
+  "pattern": "ETTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTL",
+  "forward_ms": {
+    "E": 2.3067,
+    "L": 11.251,
+    "T": 3.3185
+  },
+  "backward_ms": {
+    "E": 2.5027,
+    "L": 11.442,
+    "T": 4.2731
+  },
+  "weight_ms": {
+    "E": 0.0001,
+    "L": 3.2495,
+    "T": 2.4074
+  }
+}
