@@ -5,6 +5,7 @@ from pathlib import Path
 
 import yaml
 
+from simpipe.config.batch import BatchConfig
 from simpipe.config.hardware import HardwareConfig
 from simpipe.config.model import ModelConfig
 from simpipe.config.parallel import ParallelConfig
@@ -25,6 +26,8 @@ class SimConfig:
     # Device -> ordered stage ids on that device (length must equal parallel.pp_size).
     placement: list[list[int]] | None = None
     tuning: TuningConfig = field(default_factory=TuningConfig)
+    # Variable-length microbatch spec; when set it defines micro_batch_num.
+    batch: BatchConfig | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> SimConfig:
@@ -34,9 +37,19 @@ class SimConfig:
         # OctoPipe without explicit partition/placement: auto-search by default
         if "auto_tune" not in tuning_data and schedule == "octopipe" and not has_pp:
             tuning_data = {**tuning_data, "auto_tune": True}
+        parallel_data = dict(data.get("parallel", {}))
+        batch = BatchConfig.from_dict(data["batch"]) if data.get("batch") else None
+        if batch is not None:
+            explicit_mb = parallel_data.get("micro_batch_num")
+            if explicit_mb is not None and int(explicit_mb) != batch.num_microbatches:
+                raise ValueError(
+                    f"parallel.micro_batch_num={explicit_mb} does not match "
+                    f"batch.microbatches length {batch.num_microbatches}"
+                )
+            parallel_data["micro_batch_num"] = batch.num_microbatches
         return cls(
             model=ModelConfig(**data.get("model", {})),
-            parallel=ParallelConfig(**data.get("parallel", {})),
+            parallel=ParallelConfig(**parallel_data),
             hardware=HardwareConfig(**data.get("hardware", {})),
             schedule=schedule,
             profiled_data=bool(data.get("profiled_data", False)),
@@ -45,6 +58,7 @@ class SimConfig:
             partition_layers=data.get("partition_layers"),
             placement=data.get("placement"),
             tuning=TuningConfig.from_dict(tuning_data),
+            batch=batch,
         )
 
 

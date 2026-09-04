@@ -24,6 +24,12 @@ class TuningConfig:
     # layer*microbatch units; allocated at F start, freed after B and W)
     # exceeds this. Set to roughly num_layers to match 1F1B's rank-0 peak.
     max_inflight_layers: int | None = None
+    # Search the microbatch execution order when a variable-length batch spec
+    # is set (heuristic orders + pairwise-swap hill climb, real simulations).
+    # None follows auto_tune; the tuned order is a permutation of the input
+    # microbatch list reported as plan.mid_order / pipeline_config.
+    batch_order_tune: bool | None = None
+    batch_order_max_sims: int = 64
 
     @classmethod
     def from_dict(cls, data: dict | None) -> TuningConfig:
@@ -32,6 +38,7 @@ class TuningConfig:
         max_stage_num = data.get("max_stage_num")
         min_stage_num = data.get("min_stage_num")
         max_inflight_layers = data.get("max_inflight_layers")
+        batch_order_tune = data.get("batch_order_tune")
         return cls(
             auto_tune=bool(data.get("auto_tune", False)),
             sim_k=int(data.get("sim_k", 8)),
@@ -47,4 +54,8 @@ class TuningConfig:
             max_inflight_layers=(
                 None if max_inflight_layers is None else int(max_inflight_layers)
             ),
+            batch_order_tune=(
+                None if batch_order_tune is None else bool(batch_order_tune)
+            ),
+            batch_order_max_sims=int(data.get("batch_order_max_sims", 64)),
         )

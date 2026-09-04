@@ -9,7 +9,14 @@ from simpipe.config.pipeline_config import write_pipeline_config
 from simpipe.config.sim_config import SimConfig, load_config
 from simpipe.core.executor import build_simulation
 from simpipe.metrics.comp_bubble import analyze_pipeline_comp_bubble
-from simpipe.models.registry import PRESETS, get_preset, get_profile_times, preset_model_data
+from simpipe.models.registry import (
+    PRESETS,
+    get_preset,
+    get_profile_times,
+    mock_profile_times,
+    preset_model_data,
+    uses_mock_times,
+)
 from simpipe.tuning.bubble_overlap import format_group
 from simpipe.tuning.sweep import run_sweep, sweep_configs
 from simpipe.viz.gantt import format_gantt_detailed_info, write_gantt_svg
@@ -39,6 +46,11 @@ def _load_run_inputs(config: str | None, model: str, schedule: str | None):
         cfg.schedule = schedule
     if not cfg.profiled_data:
         return cfg, None
+    if uses_mock_times(cfg.model):
+        pt = mock_profile_times(cfg.model)
+        if cfg.model.recompute:
+            pt = pt.with_full_recompute()
+        return cfg, pt
     if cfg.model.profile_times_path:
         from simpipe.models.profile_times import profile_times_from_preset
 
@@ -127,6 +139,19 @@ def run_cmd(
                     f"dev_comp_var={dev_comp_var:.0f} dev_bubble_var={dev_bubble_var:.0f} "
                     f"warmup={warmup:.0f} cooldown={cooldown:.0f} residual={residual:.0f}"
                 )
+    bo = executor.batch_order_result
+    if bo is not None:
+        if bo.is_identity:
+            click.echo(
+                f"Batch order: input order kept, makespan {bo.makespan:.0f} "
+                f"({bo.trials} sims)"
+            )
+        else:
+            click.echo(
+                f"Batch order tuned: {bo.order} "
+                f"(makespan {bo.baseline_makespan:.0f} -> {bo.makespan:.0f}, "
+                f"{bo.trials} sims; slot k runs input microbatch order[k])"
+            )
     result = executor.run()
     out = Path(output)
     out.mkdir(parents=True, exist_ok=True)

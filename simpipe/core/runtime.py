@@ -101,8 +101,6 @@ class PipelineRuntime:
                 self.finish_flag = True
 
     def _init_devices(self) -> None:
-        from dataclasses import replace as dc_replace
-
         placement = self.plan.placement.device_stages
         # Profiled timings are in 0.01 ms ticks; the empirical overheads below
         # are given in ms and converted here.
@@ -116,18 +114,11 @@ class PipelineRuntime:
                 comp_power=self.hardware.comp_power,
                 max_mem=self.hardware.gpu_hbm_gb,
                 comm_time=comm_time,
+                workload_overhead=overhead,
                 runtime=self,
             )
             for sid in placement[did]:
-                timing = self.plan.timing_for_stage(sid)
-                if overhead > 0:
-                    timing = dc_replace(
-                        timing,
-                        f_time=timing.f_time + overhead,
-                        b_time=timing.b_time + overhead,
-                        w_time=timing.w_time + overhead if timing.w_time > 0 else timing.w_time,
-                    )
-                dev.add_stage(sid, timing)
+                dev.add_stage(sid)
             self.devices.append(dev)
 
     def _init_dynamic_ready_queues(self) -> None:
@@ -137,16 +128,26 @@ class PipelineRuntime:
             for workload in device.get_initial_executable_workload(self.time):
                 device.push_executable_workload(workload, self.time)
 
-    def f_admission_blocked(self, did: int, sid: int) -> bool:
+    def _act_weight(self, sid: int, mid: int) -> float:
+        """In-flight activation weight of one microbatch on a stage.
+
+        Base unit is one reference-shape transformer layer; variable-length
+        microbatches scale it by their token count ratio (activation bytes
+        are token-linear).
+        """
+        return self._stage_layer_weight.get(sid, 1) * self.plan.token_ratio_for_mid(mid)
+
+    def f_admission_blocked(self, did: int, sid: int, mid: int) -> bool:
         if not self.max_inflight_layers:
             return False
-        weight = self._stage_layer_weight.get(sid, 1)
+        weight = self._act_weight(sid, mid)
         # First in-flight microbatch of a stage draws from its reservation:
         # admit whenever the raw cap allows, so the mid-0 chain never stalls.
         if self._stage_inflight_mb.get(sid, 0) == 0:
             return self._inflight_layers[did] + weight > self.max_inflight_layers
         # Additional microbatches must leave the reservations of this
-        # device's still-empty stages untouched.
+        # device's still-empty stages untouched (reservations use the
+        # reference-shape weight; the incoming microbatch is unknown).
         reserved = sum(
             self._stage_layer_weight.get(s, 1)
             for s in self.plan.placement.device_stages[did]
@@ -162,7 +163,7 @@ class PipelineRuntime:
             return
         sid = workload.sid
         did = self.sid_to_did(sid)
-        weight = self._stage_layer_weight.get(sid, 1)
+        weight = self._act_weight(sid, workload.mid)
         self._inflight_layers[did] += weight
         self._stage_inflight_mb[sid] = self._stage_inflight_mb.get(sid, 0) + 1
         if self._inflight_layers[did] > self.peak_inflight_layers:

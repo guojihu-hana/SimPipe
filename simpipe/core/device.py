@@ -18,6 +18,7 @@ class Device:
         comp_power: float = 1.0,
         max_mem: float = 80.0,
         comm_time: float = 0.0,
+        workload_overhead: float = 0.0,
         runtime=None,
     ):
         self.did = device_idx
@@ -31,6 +32,7 @@ class Device:
         self.comp_power = comp_power
         self.max_mem = max_mem
         self.comm_time = comm_time
+        self.workload_overhead = workload_overhead
         self.state = Device.IDLE
         self.current_workload: Workload | None = None
         self.stages: dict[int, Stage] = {}
@@ -51,11 +53,11 @@ class Device:
         self.runtime = runtime
         self.workload_execute_record: list[Workload] = []
 
-    def add_stage(self, stage_id: int, timing, recomp: bool = False) -> None:
+    def add_stage(self, stage_id: int, recomp: bool = False) -> None:
         self.stages[stage_id] = Stage(
             stage_idx=stage_id,
             device_idx=self.did,
-            timing=timing,
+            plan=self.plan,
             schedule_method=self.schedule_method,
             total_stage_num=self.plan.stage_num,
             micro_batch_num=self.nmb,
@@ -65,6 +67,7 @@ class Device:
             recomp=recomp,
             comp_power=self.comp_power,
             comm_time=self.comm_time,
+            overhead=self.workload_overhead,
         )
 
     def get_initial_executable_workload(self, time: float) -> list[Workload]:
@@ -111,7 +114,7 @@ class Device:
                     if (
                         w.wtype == WorkloadType.F
                         and self.runtime is not None
-                        and self.runtime.f_admission_blocked(self.did, w.sid)
+                        and self.runtime.f_admission_blocked(self.did, w.sid, w.mid)
                     ):
                         not_ready_deferred.append(w)
                         continue

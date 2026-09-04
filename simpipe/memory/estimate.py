@@ -377,8 +377,13 @@ def _activation_peak_by_device(
 ) -> dict[int, int]:
     stage_bytes = {stage.stage_id: stage.activation_per_microbatch_bytes for stage in stages}
     if not records:
+        # Static fallback (one in-flight microbatch per stage): size it for
+        # the largest microbatch when a variable-length batch spec is set.
+        worst_ratio = (
+            max(lin for lin, _quad in plan.mid_scales) if plan.mid_scales else 1.0
+        )
         return {
-            did: sum(stage_bytes.get(sid, 0) for sid in stage_ids)
+            did: int(sum(stage_bytes.get(sid, 0) for sid in stage_ids) * worst_ratio)
             for did, stage_ids in enumerate(plan.placement.device_stages)
         }
 
@@ -387,12 +392,14 @@ def _activation_peak_by_device(
         for did, stage_ids in enumerate(plan.placement.device_stages)
         for sid in stage_ids
     }
-    events: dict[int, list[tuple[float, int]]] = {}
+    events: dict[int, list[tuple[float, float]]] = {}
     for record in records:
         wtype = str(record.get("wtype", "")).upper()
         sid = int(record.get("sid", 0))
         did = sid_to_did.get(sid, int(record.get("did", 0)))
-        size = stage_bytes.get(sid, 0)
+        # Activation bytes are token-linear: weight each microbatch by its
+        # token count relative to the profiled shape.
+        size = stage_bytes.get(sid, 0) * plan.token_ratio_for_mid(int(record.get("mid", 0)))
         if size <= 0:
             continue
         if wtype == "F":
@@ -404,10 +411,10 @@ def _activation_peak_by_device(
 
     peaks: dict[int, int] = {did: 0 for did in range(plan.device_num)}
     for did, device_events in events.items():
-        live = 0
+        live = 0.0
         for _time, delta in sorted(device_events, key=lambda item: (item[0], -item[1])):
-            live = max(0, live + delta)
-            peaks[did] = max(peaks[did], live)
+            live = max(0.0, live + delta)
+            peaks[did] = max(peaks[did], int(live))
     return peaks
 
 

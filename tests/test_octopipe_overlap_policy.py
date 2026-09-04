@@ -35,7 +35,7 @@ def _device_with_queue(*workloads: FakeWorkload, started_backward: bool = True) 
         overlap_exempt_workloads=set(),
         overlap_exempt_group_by="mid_type",
         is_overlap_exempt=lambda workload: False,
-        f_admission_blocked=lambda did, sid: False,
+        f_admission_blocked=lambda did, sid, mid: False,
     )
     return device
 

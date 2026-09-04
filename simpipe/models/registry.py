@@ -4,6 +4,9 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
+import yaml
+
+from simpipe.config.model import ModelConfig
 from simpipe.config.sim_config import SimConfig
 from simpipe.models.pattern import stack_layer_count, stack_layer_symbols
 from simpipe.models.profile_times import ProfileTimes, profile_times_from_preset
@@ -13,7 +16,21 @@ from simpipe.models.profile_times import ProfileTimes, profile_times_from_preset
 # model metadata and synthetic test fixtures.
 PROFILES_DIR = Path(__file__).resolve().parents[2] / "profiles"
 
+MOCK_MODEL_NAME = "mock_model"
+# Default per-layer duration (0.01 ms ticks) when mock times are not given.
+MOCK_DEFAULT_LAYER_TIME = 100.0
+
 PRESETS: dict[str, dict] = {
+    "mock_model": {
+        "model": {
+            "name": MOCK_MODEL_NAME,
+            "hidden_size": 1024,
+            "num_layers": 16,
+            "num_attention_heads": 16,
+            "seq_len": 4096,
+            "vocab_size": 32768,
+        },
+    },
     "nemotron-h-4B": {
         "model": {
             "name": "nemotron-h-4B",
@@ -125,6 +142,33 @@ def stack_layer_symbols_for_model(name: str, num_layers: int) -> list[str] | Non
     return stack_layer_symbols(pattern)[:num_layers]
 
 
+def layer_symbols_for_model_config(model: ModelConfig) -> list[str] | None:
+    """Per-layer pattern symbols for a model config, best effort.
+
+    Sources in priority order: the profile_times_path YAML pattern, the HF
+    config hybrid_override_pattern, then the registry profile/preset pattern.
+    Returns None when no pattern is known (e.g. pure-transformer models).
+    """
+    if model.profile_times_path:
+        try:
+            data = yaml.safe_load(Path(model.profile_times_path).expanduser().read_text())
+        except OSError:
+            data = None
+        pattern = (data or {}).get("pattern")
+        if pattern:
+            return stack_layer_symbols(pattern)[: model.num_layers]
+    if model.hf_config_path:
+        try:
+            with Path(model.hf_config_path).expanduser().open() as f:
+                hf_data = json.load(f)
+        except OSError:
+            hf_data = {}
+        pattern = hf_data.get("hybrid_override_pattern")
+        if pattern:
+            return stack_layer_symbols(pattern)[: model.num_layers]
+    return stack_layer_symbols_for_model(model.name, model.num_layers)
+
+
 def get_preset(name: str) -> SimConfig:
     if name not in PRESETS:
         raise KeyError(f"Unknown model preset: {name}")
@@ -134,6 +178,47 @@ def get_preset(name: str) -> SimConfig:
             "model": _model_data_from_preset(data),
             "schedule": data.get("schedule", "1f1b"),
         }
+    )
+
+
+def uses_mock_times(model: ModelConfig) -> bool:
+    return model.name == MOCK_MODEL_NAME or any(
+        value is not None
+        for value in (
+            model.layer_time,
+            model.layer_f_time,
+            model.layer_b_time,
+            model.layer_w_time,
+        )
+    )
+
+
+def mock_profile_times(model: ModelConfig) -> ProfileTimes:
+    """Uniform synthetic layer times from inline model config.
+
+    layer_time sets f=b=w (1:1:1 default); layer_f/b/w_time override
+    individual passes (B and W fall back to F).  Embedding/head cost 0.
+    """
+    f = model.layer_f_time
+    if f is None:
+        f = model.layer_time if model.layer_time is not None else MOCK_DEFAULT_LAYER_TIME
+    b = model.layer_b_time if model.layer_b_time is not None else f
+    w = model.layer_w_time if model.layer_w_time is not None else f
+    if f <= 0 or b <= 0 or w < 0:
+        raise ValueError(
+            f"mock layer times must be positive (w >= 0), got f={f} b={b} w={w}"
+        )
+    n = model.num_layers
+    return ProfileTimes(
+        layer_f=[float(f)] * n,
+        layer_b=[float(b)] * n,
+        layer_w=[float(w)] * n,
+        embedding_f=0.0,
+        embedding_b=0.0,
+        embedding_w=0.0,
+        head_f=0.0,
+        head_b=0.0,
+        head_w=0.0,
     )
 
 

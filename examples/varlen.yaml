@@ -1,0 +1,105 @@
+# Per-microbatch compute variation, all scenarios in one file:
+#   model  [M1] profiled model   [M2] mock model with inline layer times
+#   batch  [B1] pack             [B2] pad
+#          [B3] direct time scales (ratios or absolute times via time_ref)
+# Keep exactly one model: block and at most one batch: block active; swap
+# scenarios by (un)commenting the marked sections.  Any model x batch combo
+# works.
+#
+# Run:
+#   python -m simpipe.cli run --config examples/varlen.yaml \
+#       --output results_varlen --detailed-gantt
+
+profiled_data: true
+time_limit: 20000000
+
+# ---------------------------------------------------------------------------
+# [M1] Profiled model (active): per-layer F/B/W from profiles/<name>.json,
+#      reference shape model.micro_batch_size x model.seq_len = 1 x 4096.
+#      batch.microbatches scales times against that reference.
+model:
+  name: nemotron-h-4B
+
+# [M2] Mock model: synthetic per-layer times, no profile data needed.
+#      layer_time      per-layer duration in 0.01 ms ticks, F = B = W (1:1:1)
+#      layer_f_time / layer_b_time / layer_w_time
+#                      override individual passes (B and W default to F)
+#      num_layers      layer count; embedding/head cost 0
+# model:
+#   name: mock_model
+#   num_layers: 16
+#   layer_time: 1000        # 10 ms per layer
+#   # layer_b_time: 2000    # e.g. F:B:W = 1:2:1
+
+parallel:
+  pp_size: 4
+  bwd_split: True
+  # micro_batch_num is derived from the batch: list; set it explicitly only
+  # when running without a batch: block.
+
+# Auto-tune searches partition/placement/chunking; candidate simulations
+# inherit the batch spec, so the result is optimized for this exact
+# microbatch mix.  With auto-tune on, the microbatch execution order is also
+# searched (tuning.batch_order_tune; the permutation is reported and written
+# to pipeline_config.yaml as batch_order).  NOTE: explicit
+# partition_layers/placement override and disable auto-tune -- leave them
+# unset to tune.
+schedule: octopipe
+
+tuning:
+  auto_tune: true
+  batch_order_tune: true
+
+# For a fast deterministic run without tuning, uncomment:
+# partition_layers: [13, 13, 13, 13]
+# placement: [[0], [1], [2], [3]]
+# tuning:
+#   auto_tune: false
+
+# ---------------------------------------------------------------------------
+# [B1] PACK (active): each entry lists the raw sequence lengths grouped into
+#      one microbatch; sequences are concatenated without padding (varlen
+#      kernels, block-diagonal attention):
+#        linear work  (GEMM / mamba / norm / W pass / activation bytes) ~ sum(len)
+#        attention score work                                           ~ sum(len^2)
+#      Layers without a quadratic term (mamba / MLP) scale linearly only.
+batch:
+  mode: pack
+  microbatches:
+    - [4096]                    # reference microbatch
+    - [2048, 2048]              # same tokens packed -> attention time drops
+    - [2048, 1024, 512]         # short microbatch (3584 tokens)
+    - [8192]                    # one long doc: 2x tokens, 4x attention score
+    - [1024, 1024, 1024, 1024]  # many short sequences
+    - [6144, 2048]              # 8192 tokens packed into two docs
+
+# [B2] PAD: same sequences, but every microbatch pads to its longest one:
+#        linear work ~ n_seqs * max(len)
+#        attention score work ~ n_seqs * max(len)^2
+#      Padding inflates time and activation memory versus pack mode; running
+#      both shows the difference in makespan and peak memory.
+# batch:
+#   mode: pad
+#   microbatches:
+#     - [4096]                    # reference microbatch
+#     - [2048, 2048]              # pads to 2 x 2048 (no waste, equal lengths)
+#     - [2048, 1024, 512]         # pads to 3 x 2048 = 6144 tokens (was 3584)
+#     - [8192]                    # one long doc
+#     - [1024, 1024, 1024, 1024]  # pads to 4 x 1024 (no waste)
+#     - [6144, 2048]              # pads to 2 x 6144 = 12288 tokens (was 8192)
+
+# [B3] Direct time scales: per-microbatch compute-time multiplier vs the
+#      profiled reference (1.0 = reference); no sequence-length modeling, no
+#      linear/quadratic split.  F/B/W durations of every stage are multiplied
+#      by the factor and activation memory is weighted by the same factor
+#      (token-linear approximation).  Absolute measured times work via
+#      time_ref (scale = value / time_ref).
+# batch:
+#   time_scales: [1, 1, 1.5, 1.5, 0.5, 0.5, 1, 2]
+#   # time_scales: [2000, 3000, 4000]   # measured per-mb times ...
+#   # time_ref: 2000                    # ... -> scales [1.0, 1.5, 2.0]
+
+hardware:
+  gpu_peak_tflops: 312.0
+  gpu_hbm_gb: 80.0
+  intra_node_bw_gbps: 600.0

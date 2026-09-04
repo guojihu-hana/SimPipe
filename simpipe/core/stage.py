@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from simpipe.core.types import WorkloadConstraint, WorkloadType
 from simpipe.core.workload import Workload
+from simpipe.pipeline.types import WorkloadPlan
+from simpipe.pipeline.workload_gen import stage_timing
 
 
 class Stage:
@@ -9,7 +11,7 @@ class Stage:
         self,
         stage_idx: int,
         device_idx: int,
-        timing,
+        plan: WorkloadPlan,
         schedule_method,
         total_stage_num: int,
         micro_batch_num: int,
@@ -21,10 +23,14 @@ class Stage:
         comp_power: float = 1.0,
         vocab_parallel: bool = False,
         comm_time: float = 0.0,
+        overhead: float = 0.0,
     ):
         self.sid = stage_idx
         self.did = device_idx
-        self.timing = timing
+        # Durations come straight from the plan: uniform across microbatches
+        # by default, per-mid scaled when config.batch sets plan.mid_scales.
+        self.plan = plan
+        self.overhead = overhead
         self.total_stage_num = total_stage_num
         self.bwd_split = bwd_split
         self.workloads: dict[int, dict[WorkloadType, Workload]] = {}
@@ -55,11 +61,12 @@ class Stage:
         comm_time,
     ) -> None:
         for mid in range(mid_offset, mid_offset + nmb):
+            timing = stage_timing(self.plan, self.sid, mid, self.overhead)
             self.workloads[mid] = {}
             for wtype, duration in (
-                (WorkloadType.F, self.timing.f_time),
-                (WorkloadType.B, self.timing.b_time),
-                (WorkloadType.W, self.timing.w_time),
+                (WorkloadType.F, timing.f_time),
+                (WorkloadType.B, timing.b_time),
+                (WorkloadType.W, timing.w_time),
             ):
                 if wtype == WorkloadType.W and not bwd_split and duration <= 0:
                     continue
