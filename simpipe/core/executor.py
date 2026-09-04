@@ -137,6 +137,9 @@ def build_simulation(
         sched, layer_f_times, layer_b_times, layer_w_times
     )
 
+    from simpipe.models.registry import layer_symbols_for_model_config
+
+    layer_symbols = layer_symbols_for_model_config(config.model)
     graph = ModelGraph.from_config(config.model)
     pp = config.parallel
     if layer_f_times:
@@ -214,8 +217,13 @@ def build_simulation(
         head_f_time,
         head_b_time,
         head_w_time,
+        layer_symbols=layer_symbols,
     )
     plan.layers_per_stage = list(partition_layers)
+    if config.batch is not None:
+        plan.mid_scales = config.batch.scales(
+            config.model.micro_batch_size, config.model.seq_len
+        )
     executor = Executor(
         config,
         graph,

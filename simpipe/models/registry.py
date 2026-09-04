@@ -4,6 +4,9 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
+import yaml
+
+from simpipe.config.model import ModelConfig
 from simpipe.config.sim_config import SimConfig
 from simpipe.models.pattern import stack_layer_count, stack_layer_symbols
 from simpipe.models.profile_times import ProfileTimes, profile_times_from_preset
@@ -123,6 +126,33 @@ def stack_layer_symbols_for_model(name: str, num_layers: int) -> list[str] | Non
     if not pattern:
         return None
     return stack_layer_symbols(pattern)[:num_layers]
+
+
+def layer_symbols_for_model_config(model: ModelConfig) -> list[str] | None:
+    """Per-layer pattern symbols for a model config, best effort.
+
+    Sources in priority order: the profile_times_path YAML pattern, the HF
+    config hybrid_override_pattern, then the registry profile/preset pattern.
+    Returns None when no pattern is known (e.g. pure-transformer models).
+    """
+    if model.profile_times_path:
+        try:
+            data = yaml.safe_load(Path(model.profile_times_path).expanduser().read_text())
+        except OSError:
+            data = None
+        pattern = (data or {}).get("pattern")
+        if pattern:
+            return stack_layer_symbols(pattern)[: model.num_layers]
+    if model.hf_config_path:
+        try:
+            with Path(model.hf_config_path).expanduser().open() as f:
+                hf_data = json.load(f)
+        except OSError:
+            hf_data = {}
+        pattern = hf_data.get("hybrid_override_pattern")
+        if pattern:
+            return stack_layer_symbols(pattern)[: model.num_layers]
+    return stack_layer_symbols_for_model(model.name, model.num_layers)
 
 
 def get_preset(name: str) -> SimConfig:
