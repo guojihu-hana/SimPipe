@@ -50,12 +50,18 @@ def format_pipeline_config_yaml(
     makespan: float | None = None,
     stage_layers: list[str] | None = None,
     memory: dict[str, Any] | None = None,
+    batch_order: list[int] | None = None,
 ) -> str:
     lines = [
         f"schedule: {schedule}",
         f"partition: {_format_inline_list(partition)}",
         f"placement: {_format_inline_nested_list(placement)}",
     ]
+    if batch_order is not None:
+        lines.append(
+            f"batch_order: {_format_inline_list(batch_order)}"
+            "  # slot mid k runs input microbatch batch_order[k]"
+        )
     if stage_layers is not None:
         lines.append(
             "stage_layers:  # stage_idx: layer pattern "
@@ -87,6 +93,7 @@ def build_pipeline_config(
     chunk_num: int | None = None,
     stage_layers: list[str] | None = None,
     memory: dict[str, Any] | None = None,
+    batch_order: list[int] | None = None,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {
         "schedule": schedule,
@@ -102,6 +109,8 @@ def build_pipeline_config(
         data["makespan"] = makespan
     if memory is not None:
         data["memory"] = memory
+    if batch_order is not None:
+        data["batch_order"] = batch_order
     return data
 
 
@@ -139,6 +148,7 @@ def build_pipeline_config_from_executor(
         chunk_num=executor.config.parallel.chunk_num,
         stage_layers=stage_layers,
         memory=memory,
+        batch_order=executor.plan.mid_order,
     )
 
 
@@ -185,6 +195,7 @@ def write_pipeline_config(
             makespan=data.get("makespan"),
             stage_layers=data.get("stage_layers"),
             memory=data.get("memory"),
+            batch_order=data.get("batch_order"),
         )
     )
 

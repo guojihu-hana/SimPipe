@@ -160,6 +160,15 @@ def tune_octopipe(
 ) -> OctoPipeTuneResult:
     """Three-phase tuning: partition variance, placement bubble, scheduling overlap."""
     tuning = tuning or TuningConfig()
+    # Candidate evaluations rank by input microbatch order; the microbatch
+    # order search (batch_order_tune) runs once on the winning configuration
+    # in build_simulation, not per candidate.
+    if config.batch is not None:
+        from dataclasses import replace as dc_replace
+
+        config = dc_replace(
+            config, tuning=dc_replace(config.tuning, batch_order_tune=False)
+        )
     schedule = parse_schedule(config.schedule)
     pp = config.parallel
     emb = _embedding_head_times(

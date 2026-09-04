@@ -37,6 +37,9 @@ class WorkloadPlan:
     # Per-microbatch (linear_scale, quadratic_scale) vs the profiled shape,
     # indexed by local microbatch id (mid % len).  None = uniform microbatches.
     mid_scales: list[tuple[float, float]] | None = None
+    # Tuned execution order: slot mid k runs input microbatch mid_order[k]
+    # (mid_scales is already permuted accordingly).  None = input order.
+    mid_order: list[int] | None = None
 
     @property
     def stage_num(self) -> int:

@@ -57,6 +57,7 @@ class Executor:
         self.overlap_exempt_group_by = overlap_exempt_group_by
         self.bubble_overlap_trials = bubble_overlap_trials or []
         self.tune_top_results: list = []
+        self.batch_order_result = None
         self.time = 0
         self._init_pipelines()
 
@@ -220,10 +221,38 @@ def build_simulation(
         layer_symbols=layer_symbols,
     )
     plan.layers_per_stage = list(partition_layers)
+    batch_order_result = None
     if config.batch is not None:
         plan.mid_scales = config.batch.scales(
             config.model.micro_batch_size, config.model.seq_len
         )
+        order_tune = config.tuning.batch_order_tune
+        if order_tune is None:
+            order_tune = config.tuning.auto_tune
+        if order_tune and len(set(plan.mid_scales)) > 1:
+            from simpipe.tuning.batch_order import tune_batch_order
+
+            scales = list(plan.mid_scales)
+
+            def _evaluate(order: list[int]) -> float:
+                trial_plan = replace(
+                    plan, mid_scales=[scales[i] for i in order]
+                )
+                result = Executor(
+                    config,
+                    graph,
+                    trial_plan,
+                    overlap_exempt_workloads=overlap_exempt_workloads,
+                    overlap_exempt_group_by=overlap_exempt_group_by,
+                ).run()
+                return float("inf") if result.stalled else result.makespan
+
+            batch_order_result = tune_batch_order(
+                scales, _evaluate, config.tuning.batch_order_max_sims
+            )
+            if not batch_order_result.is_identity:
+                plan.mid_scales = [scales[i] for i in batch_order_result.order]
+                plan.mid_order = list(batch_order_result.order)
     executor = Executor(
         config,
         graph,
@@ -233,4 +262,5 @@ def build_simulation(
         bubble_overlap_trials=bubble_overlap_trials,
     )
     executor.tune_top_results = tune_top_results
+    executor.batch_order_result = batch_order_result
     return executor

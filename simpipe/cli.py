@@ -139,6 +139,19 @@ def run_cmd(
                     f"dev_comp_var={dev_comp_var:.0f} dev_bubble_var={dev_bubble_var:.0f} "
                     f"warmup={warmup:.0f} cooldown={cooldown:.0f} residual={residual:.0f}"
                 )
+    bo = executor.batch_order_result
+    if bo is not None:
+        if bo.is_identity:
+            click.echo(
+                f"Batch order: input order kept, makespan {bo.makespan:.0f} "
+                f"({bo.trials} sims)"
+            )
+        else:
+            click.echo(
+                f"Batch order tuned: {bo.order} "
+                f"(makespan {bo.baseline_makespan:.0f} -> {bo.makespan:.0f}, "
+                f"{bo.trials} sims; slot k runs input microbatch order[k])"
+            )
     result = executor.run()
     out = Path(output)
     out.mkdir(parents=True, exist_ok=True)
