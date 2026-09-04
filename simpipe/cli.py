@@ -9,7 +9,14 @@ from simpipe.config.pipeline_config import write_pipeline_config
 from simpipe.config.sim_config import SimConfig, load_config
 from simpipe.core.executor import build_simulation
 from simpipe.metrics.comp_bubble import analyze_pipeline_comp_bubble
-from simpipe.models.registry import PRESETS, get_preset, get_profile_times, preset_model_data
+from simpipe.models.registry import (
+    PRESETS,
+    get_preset,
+    get_profile_times,
+    mock_profile_times,
+    preset_model_data,
+    uses_mock_times,
+)
 from simpipe.tuning.bubble_overlap import format_group
 from simpipe.tuning.sweep import run_sweep, sweep_configs
 from simpipe.viz.gantt import format_gantt_detailed_info, write_gantt_svg
@@ -39,6 +46,11 @@ def _load_run_inputs(config: str | None, model: str, schedule: str | None):
         cfg.schedule = schedule
     if not cfg.profiled_data:
         return cfg, None
+    if uses_mock_times(cfg.model):
+        pt = mock_profile_times(cfg.model)
+        if cfg.model.recompute:
+            pt = pt.with_full_recompute()
+        return cfg, pt
     if cfg.model.profile_times_path:
         from simpipe.models.profile_times import profile_times_from_preset
 

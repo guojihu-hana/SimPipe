@@ -23,6 +23,14 @@ class ModelConfig:
     # JSON with {"pattern": "E...L", "forward_ms": {...}, "backward_ms": {...},
     # "weight_ms": {...}} (solver fit output); overrides registry presets.
     profile_times_path: str | None = None
+    # Inline synthetic timings (mock_model, or any model when set): uniform
+    # per-layer F/B/W durations in 0.01 ms ticks.  layer_time is the 1:1:1
+    # shorthand; layer_f/b/w_time override individual passes, B/W default to
+    # F.  Embedding/head cost 0.
+    layer_time: float | None = None
+    layer_f_time: float | None = None
+    layer_b_time: float | None = None
+    layer_w_time: float | None = None
     flash_attention: bool = True
     # Full activation recompute: backward re-runs forward first, so each
     # checkpointed body layer costs f+b in the backward pass (emb/head excluded).

@@ -16,7 +16,21 @@ from simpipe.models.profile_times import ProfileTimes, profile_times_from_preset
 # model metadata and synthetic test fixtures.
 PROFILES_DIR = Path(__file__).resolve().parents[2] / "profiles"
 
+MOCK_MODEL_NAME = "mock_model"
+# Default per-layer duration (0.01 ms ticks) when mock times are not given.
+MOCK_DEFAULT_LAYER_TIME = 100.0
+
 PRESETS: dict[str, dict] = {
+    "mock_model": {
+        "model": {
+            "name": MOCK_MODEL_NAME,
+            "hidden_size": 1024,
+            "num_layers": 16,
+            "num_attention_heads": 16,
+            "seq_len": 4096,
+            "vocab_size": 32768,
+        },
+    },
     "nemotron-h-4B": {
         "model": {
             "name": "nemotron-h-4B",
@@ -164,6 +178,47 @@ def get_preset(name: str) -> SimConfig:
             "model": _model_data_from_preset(data),
             "schedule": data.get("schedule", "1f1b"),
         }
+    )
+
+
+def uses_mock_times(model: ModelConfig) -> bool:
+    return model.name == MOCK_MODEL_NAME or any(
+        value is not None
+        for value in (
+            model.layer_time,
+            model.layer_f_time,
+            model.layer_b_time,
+            model.layer_w_time,
+        )
+    )
+
+
+def mock_profile_times(model: ModelConfig) -> ProfileTimes:
+    """Uniform synthetic layer times from inline model config.
+
+    layer_time sets f=b=w (1:1:1 default); layer_f/b/w_time override
+    individual passes (B and W fall back to F).  Embedding/head cost 0.
+    """
+    f = model.layer_f_time
+    if f is None:
+        f = model.layer_time if model.layer_time is not None else MOCK_DEFAULT_LAYER_TIME
+    b = model.layer_b_time if model.layer_b_time is not None else f
+    w = model.layer_w_time if model.layer_w_time is not None else f
+    if f <= 0 or b <= 0 or w < 0:
+        raise ValueError(
+            f"mock layer times must be positive (w >= 0), got f={f} b={b} w={w}"
+        )
+    n = model.num_layers
+    return ProfileTimes(
+        layer_f=[float(f)] * n,
+        layer_b=[float(b)] * n,
+        layer_w=[float(w)] * n,
+        embedding_f=0.0,
+        embedding_b=0.0,
+        embedding_w=0.0,
+        head_f=0.0,
+        head_b=0.0,
+        head_w=0.0,
     )
 
 
