@@ -216,12 +216,3 @@ class Device:
         if workload.state == Workload.not_started and len(workload.constraints) == 0:
             self.executable_workloads.push(workload)
 
-    def update_constraints_within_device(self, time: float, completed: Workload) -> list[Workload]:
-        ready: list[Workload] = []
-        for sid in self.stages:
-            workload = self.stages[sid].update_constraints_within_stage(time, completed)
-            if workload and workload.state == Workload.not_started and len(workload.constraints) == 0:
-                ready.append(workload)
-                if self.schedule_method == Schedule.OctoPipe:
-                    self.executable_workloads.push(workload)
-        return ready

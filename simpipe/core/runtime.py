@@ -127,6 +127,14 @@ class PipelineRuntime:
             for sid in placement[did]:
                 dev.add_stage(sid)
             self.devices.append(dev)
+        # Constraint edges only connect adjacent stages, so completions are
+        # delivered to sid-1/sid/sid+1 directly instead of broadcast to every
+        # stage of every device (each sid lives on exactly one device).
+        self._stage_index = {
+            sid: (device, stage)
+            for device in self.devices
+            for sid, stage in device.stages.items()
+        }
 
     def _init_dynamic_ready_queues(self) -> None:
         if self.plan.schedule != Schedule.OctoPipe:
@@ -246,8 +254,18 @@ class PipelineRuntime:
                 device.current_workload = None
 
     def _propagate_constraints(self, completed: Workload, time: float) -> None:
-        for device in self.devices:
-            device.update_constraints_within_device(time, completed)
+        for sid in (completed.sid - 1, completed.sid, completed.sid + 1):
+            entry = self._stage_index.get(sid)
+            if entry is None:
+                continue
+            device, stage = entry
+            for w in stage.update_constraints_within_stage(time, completed):
+                if (
+                    device.schedule_method == Schedule.OctoPipe
+                    and w.state == Workload.not_started
+                    and len(w.constraints) == 0
+                ):
+                    device.executable_workloads.push(w)
 
     def execute_workload(self, time: float) -> None:
         for device in self.devices:
