@@ -136,12 +136,21 @@ class Device:
             return None
         if self.static_schedule and self.next_workload_idx < len(self.static_schedule):
             wtype, mid, sid = self.static_schedule[self.next_workload_idx]
+            # Static schedules are generated with mids 0..nmb-1; replica
+            # pipelines (dp_idx > 0) number their workloads from mid_offset.
+            mid += self.mid_offset
             stage = self.stages.get(sid)
-            if stage:
-                w = stage.get_workload(mid, wtype)
-                if w and w.is_executable(time):
-                    self.next_workload_idx += 1
-                    return w
+            if stage is None:
+                # A schedule/placement mismatch would otherwise stall silently
+                # (this entry never executes and the index never advances).
+                raise RuntimeError(
+                    f"static schedule references stage {sid} which is not placed "
+                    f"on device {self.did} (placement: {self.placement})"
+                )
+            w = stage.get_workload(mid, wtype)
+            if w and w.is_executable(time):
+                self.next_workload_idx += 1
+                return w
             return None
         for stage in self.stages.values():
             for wmap in stage.workloads.values():
@@ -207,12 +216,3 @@ class Device:
         if workload.state == Workload.not_started and len(workload.constraints) == 0:
             self.executable_workloads.push(workload)
 
-    def update_constraints_within_device(self, time: float, completed: Workload) -> list[Workload]:
-        ready: list[Workload] = []
-        for sid in self.stages:
-            workload = self.stages[sid].update_constraints_within_stage(time, completed)
-            if workload and workload.state == Workload.not_started and len(workload.constraints) == 0:
-                ready.append(workload)
-                if self.schedule_method == Schedule.OctoPipe:
-                    self.executable_workloads.push(workload)
-        return ready

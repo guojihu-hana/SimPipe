@@ -24,14 +24,24 @@ class ZBHStrategy(ScheduleStrategy):
         ]
 
         for did in range(ctx.device_num):
+            # Stage actually placed on this device; warmup depth follows the
+            # stage's pipeline position (supports swapped-rank placements).
+            sids = ctx.placement.device_stages[did]
+            if len(sids) != 1:
+                raise ValueError(
+                    f"zbh schedules one stage per device, but device {did} holds "
+                    f"stages {sids}; use interleaved or octopipe for multi-stage "
+                    "placements"
+                )
+            sid = sids[0]
             accumulated_act_num = min(
                 ctx.micro_batch_num,
-                (ctx.device_num - did - 1) * max_act + 1,
+                (ctx.stage_num - sid - 1) * max_act + 1,
             )
             mids = [0] * workload_type_num
 
             while mids[0] < min(accumulated_act_num, ctx.micro_batch_num):
-                schedule[did].append((WorkloadType.F, mids[0] + mid_offset, did))
+                schedule[did].append((WorkloadType.F, mids[0] + mid_offset, sid))
                 mids[0] += 1
 
             it = 0
@@ -45,7 +55,7 @@ class ZBHStrategy(ScheduleStrategy):
                     it += 1
                     continue
                 if next_mid < ctx.micro_batch_num:
-                    schedule[did].append((next_wtype, next_mid + mid_offset, did))
+                    schedule[did].append((next_wtype, next_mid + mid_offset, sid))
                     mids[slot] += 1
                 else:
                     finish_flag[slot] = 1

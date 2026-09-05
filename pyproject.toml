@@ -16,7 +16,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+web = ["flask>=2.3"]
+dev = ["pytest>=7.4", "flask>=2.3"]
 
 [project.scripts]
 simpipe = "simpipe.cli:main"
@@ -24,6 +25,9 @@ simpipe = "simpipe.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["simpipe*"]
+
+[tool.setuptools.package-data]
+"simpipe.web" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

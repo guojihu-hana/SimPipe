@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import math
 
 from simpipe.config.hardware import HardwareConfig
@@ -43,6 +44,14 @@ class PipelineRuntime:
         self.workload_execute_record: list[list[Workload]] = [
             [] for _ in range(self.device_num)
         ]
+        # Future wake-up ticks for run_discrete, registered when a workload
+        # starts: its end (completion, same-device release) and end+comm
+        # (cross-device release lands after the P2P latency).  Together these
+        # cover every instant the pipeline state can change, so _next_tick
+        # pops the heap instead of rescanning every workload's ready_time.
+        self._event_heap: list[int] = []
+        # set once the first B starts; replaces scanning execution records
+        self._backward_started = False
         # Activation-memory admission control: block F launches that would
         # push a device's in-flight activations (layer*microbatch; allocated
         # at F start, freed when B and W both finish) over the cap.  The
@@ -120,6 +129,14 @@ class PipelineRuntime:
             for sid in placement[did]:
                 dev.add_stage(sid)
             self.devices.append(dev)
+        # Constraint edges only connect adjacent stages, so completions are
+        # delivered to sid-1/sid/sid+1 directly instead of broadcast to every
+        # stage of every device (each sid lives on exactly one device).
+        self._stage_index = {
+            sid: (device, stage)
+            for device in self.devices
+            for sid, stage in device.stages.items()
+        }
 
     def _init_dynamic_ready_queues(self) -> None:
         if self.plan.schedule != Schedule.OctoPipe:
@@ -159,6 +176,12 @@ class PipelineRuntime:
         )
 
     def on_workload_started(self, workload: Workload) -> None:
+        end = workload.end_time or 0.0
+        heapq.heappush(self._event_heap, int(math.ceil(end)))
+        if workload.comm_time:
+            heapq.heappush(self._event_heap, int(math.ceil(end + workload.comm_time)))
+        if workload.wtype == WorkloadType.B:
+            self._backward_started = True
         if not self.max_inflight_layers or workload.wtype != WorkloadType.F:
             return
         sid = workload.sid
@@ -201,13 +224,7 @@ class PipelineRuntime:
         return 0
 
     def has_started_backward(self) -> bool:
-        for device in self.devices:
-            if device.current_workload and device.current_workload.wtype == WorkloadType.B:
-                return True
-            for workload in device.workload_execute_record:
-                if workload.wtype == WorkloadType.B:
-                    return True
-        return False
+        return self._backward_started
 
     def is_overlap_exempt(self, workload: Workload) -> bool:
         mode = self.overlap_exempt_group_by.lower().replace("+", "_").replace("-", "_")
@@ -235,8 +252,18 @@ class PipelineRuntime:
                 device.current_workload = None
 
     def _propagate_constraints(self, completed: Workload, time: float) -> None:
-        for device in self.devices:
-            device.update_constraints_within_device(time, completed)
+        for sid in (completed.sid - 1, completed.sid, completed.sid + 1):
+            entry = self._stage_index.get(sid)
+            if entry is None:
+                continue
+            device, stage = entry
+            for w in stage.update_constraints_within_stage(time, completed):
+                if (
+                    device.schedule_method == Schedule.OctoPipe
+                    and w.state == Workload.not_started
+                    and len(w.constraints) == 0
+                ):
+                    device.executable_workloads.push(w)
 
     def execute_workload(self, time: float) -> None:
         for device in self.devices:
@@ -286,21 +313,13 @@ class PipelineRuntime:
         return self.time
 
     def _next_tick(self, time_limit: int) -> int:
+        heap = self._event_heap
         t0 = self.time
-        ticks: set[int] = set()
-        for device in self.devices:
-            if device.current_workload and device.current_workload.end_time:
-                et = int(math.ceil(device.current_workload.end_time))
-                if et > t0:
-                    ticks.add(et)
-            for stage in device.stages.values():
-                for wmap in stage.workloads.values():
-                    for w in wmap.values():
-                        if w.ready_time > t0:
-                            ticks.add(int(w.ready_time))
-        if not ticks:
+        while heap and heap[0] <= t0:
+            heapq.heappop(heap)
+        if not heap:
             return min(t0 + 1, time_limit + 1)
-        return min(min(ticks), time_limit + 1)
+        return min(heap[0], time_limit + 1)
 
     def collect_results(self) -> dict:
         records = []

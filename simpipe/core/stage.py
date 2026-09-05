@@ -91,39 +91,42 @@ class Stage:
     def get_workload(self, mid: int, wtype: WorkloadType) -> Workload | None:
         return self.workloads.get(mid, {}).get(wtype)
 
-    def update_constraints_within_stage(self, time: float, completed: Workload) -> Workload | None:
-        """Targeted constraint release matching PipelineSimulator Stage logic."""
-        c_did = completed.did
+    def update_constraints_within_stage(self, time: float, completed: Workload) -> list[Workload]:
+        """Release the constraints this completion satisfies on this stage.
+
+        Returns every touched workload (callers re-check executability).
+        Constraint removal is an exact discard, so releasing a workload that
+        depends on something else is a no-op.
+        """
         c_sid = completed.sid
         c_mid = completed.mid
         c_wlt = completed.wtype
+        cstr = WorkloadConstraint(completed.did, c_mid, c_sid, c_wlt)
+        out: list[Workload] = []
+
+        def release(wtype: WorkloadType) -> None:
+            w = self.workloads.get(c_mid, {}).get(wtype)
+            if w is not None:
+                w.update_constraints(time, cstr)
+                out.append(w)
 
         if c_wlt == WorkloadType.F:
-            if self.sid == c_sid + 1 and c_mid in self.workloads:
-                cstr = WorkloadConstraint(c_did, c_mid, c_sid, c_wlt)
-                self.workloads[c_mid][WorkloadType.F].update_constraints(time, cstr)
-                return self.workloads[c_mid][WorkloadType.F]
-            if self.sid == c_sid and self.sid == completed.total_stage_num - 1:
-                cstr = WorkloadConstraint(c_did, c_mid, c_sid, c_wlt)
-                self.workloads[c_mid][WorkloadType.B].update_constraints(time, cstr)
-                return self.workloads[c_mid][WorkloadType.B]
+            if self.sid == c_sid + 1:
+                release(WorkloadType.F)
+            elif self.sid == c_sid:
+                if self.sid == completed.total_stage_num - 1:
+                    release(WorkloadType.B)
+                # split-recompute: R re-runs this stage's forward, gated on F
+                release(WorkloadType.R)
         elif c_wlt == WorkloadType.B:
-            if self.sid == c_sid - 1 and c_mid in self.workloads:
-                cstr = WorkloadConstraint(c_did, c_mid, c_sid, c_wlt)
-                self.workloads[c_mid][WorkloadType.B].update_constraints(time, cstr)
-                return self.workloads[c_mid][WorkloadType.B]
-            if self.sid == c_sid and self.bwd_split and c_mid in self.workloads:
-                cstr = WorkloadConstraint(c_did, c_mid, c_sid, c_wlt)
-                self.workloads[c_mid][WorkloadType.W].update_constraints(time, cstr)
-                return self.workloads[c_mid][WorkloadType.W]
+            if self.sid == c_sid - 1:
+                release(WorkloadType.B)
+            elif self.sid == c_sid and self.bwd_split:
+                release(WorkloadType.W)
         elif c_wlt == WorkloadType.R:
-            if self.sid == c_sid and c_mid in self.workloads:
-                cstr = WorkloadConstraint(c_did, c_mid, c_sid, c_wlt)
-                self.workloads[c_mid][WorkloadType.B].update_constraints(time, cstr)
-                return self.workloads[c_mid][WorkloadType.B]
+            if self.sid == c_sid:
+                release(WorkloadType.B)
         elif c_wlt == WorkloadType.W:
-            if self.sid == c_sid - 1 and c_mid in self.workloads:
-                cstr = WorkloadConstraint(c_did, c_mid, c_sid, c_wlt)
-                self.workloads[c_mid][WorkloadType.B].update_constraints(time, cstr)
-                return self.workloads[c_mid][WorkloadType.B]
-        return None
+            if self.sid == c_sid - 1:
+                release(WorkloadType.B)
+        return out

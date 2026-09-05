@@ -104,44 +104,69 @@ def top_partitions_by_stage_variance(
     if stage_num <= 0 or stage_num > num_layers:
         return []
 
-    partial: dict[tuple[int, int], list[tuple[list[int], list[float]]]] = {
-        (0, 0): [([], [])]
-    }
+    # Prefix sums make the per-stage comp an O(1) range query.  Beam entries
+    # are parent-pointer chains (count, stage_comp, parent) carrying running
+    # (sum, sum-of-squares), so extending a candidate is O(1): no per-step
+    # counts/times list copies, and the trim ranking uses the O(1) identity
+    # var = s2/n - (s/n)^2.  Only the trim survivors ever get materialized.
+    prefix = [0.0]
+    for i in range(num_layers):
+        w = layer_w[i] if layer_w is not None and i < len(layer_w) else 0.0
+        prefix.append(prefix[-1] + layer_f[i] + layer_b[i] + w)
+
+    # entry = (sum, sumsq, count, stage_comp, parent_entry | None)
+    Entry = tuple  # recursive tuple chain
+    partial: dict[tuple[int, int], list[Entry]] = {(0, 0): [(0.0, 0.0, 0, 0.0, None)]}
+
+    emb_time = embedding_f_time + embedding_b_time + embedding_w_time
+    head_time = head_f_time + head_b_time + head_w_time
 
     for stages_used in range(1, stage_num + 1):
-        next_partial: dict[tuple[int, int], list[tuple[list[int], list[float]]]] = {}
+        next_partial: dict[tuple[int, int], list[Entry]] = {}
         for (pos, prev_stages), entries in partial.items():
             if prev_stages != stages_used - 1:
                 continue
             remaining_layers = num_layers - pos
             remaining_stages = stage_num - stages_used
-            for counts, times in entries:
-                max_count = remaining_layers - remaining_stages
-                for count in range(1, max_count + 1):
-                    start = pos
-                    end = pos + count
-                    stage_comp = _layer_comp(layer_f, layer_b, layer_w, start, end)
-                    if stages_used == 1:
-                        stage_comp += embedding_f_time + embedding_b_time + embedding_w_time
-                    if stages_used == stage_num:
-                        stage_comp += head_f_time + head_b_time + head_w_time
-                    key = (end, stages_used)
-                    next_partial.setdefault(key, []).append(
-                        (counts + [count], times + [stage_comp])
+            max_count = remaining_layers - remaining_stages
+            base = prefix[pos]
+            extra = (emb_time if stages_used == 1 else 0.0) + (
+                head_time if stages_used == stage_num else 0.0
+            )
+            for count in range(1, max_count + 1):
+                stage_comp = prefix[pos + count] - base + extra
+                sq = stage_comp * stage_comp
+                bucket = next_partial.setdefault((pos + count, stages_used), [])
+                for entry in entries:
+                    bucket.append(
+                        (entry[0] + stage_comp, entry[1] + sq, count, stage_comp, entry)
                     )
 
-        trimmed: dict[tuple[int, int], list[tuple[list[int], list[float]]]] = {}
+        trimmed: dict[tuple[int, int], list[Entry]] = {}
         keep = max(top_k * 4, top_k)
+        n = float(stages_used)
         for key, entries in next_partial.items():
-            ranked = sorted(entries, key=lambda item: partition_variance(item[1]))
+            ranked = sorted(entries, key=lambda e: e[1] / n - (e[0] / n) ** 2)
             trimmed[key] = ranked[:keep]
         partial = trimmed
+
+    def _materialize(entry: Entry) -> tuple[list[int], list[float]]:
+        counts: list[int] = []
+        times: list[float] = []
+        while entry is not None and entry[2]:
+            counts.append(entry[2])
+            times.append(entry[3])
+            entry = entry[4]
+        counts.reverse()
+        times.reverse()
+        return counts, times
 
     finished: list[tuple[float, list[int]]] = []
     for (pos, stages_used), entries in partial.items():
         if pos != num_layers or stages_used != stage_num:
             continue
-        for counts, times in entries:
+        for entry in entries:
+            counts, times = _materialize(entry)
             finished.append((partition_variance(times), counts))
 
     finished.sort(key=lambda x: x[0])

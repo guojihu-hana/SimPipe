@@ -6,15 +6,17 @@ import click
 import yaml
 
 from simpipe.config.pipeline_config import write_pipeline_config
-from simpipe.config.sim_config import SimConfig, load_config
-from simpipe.core.executor import build_simulation
+from simpipe.config.sim_config import SimConfig
+from simpipe.core.executor import build_simulation, first_replica_records
 from simpipe.metrics.comp_bubble import analyze_pipeline_comp_bubble
 from simpipe.models.registry import (
+    MOCK_MODEL_NAME,
     PRESETS,
     get_preset,
     get_profile_times,
     mock_profile_times,
     preset_model_data,
+    profile_data,
     uses_mock_times,
 )
 from simpipe.tuning.bubble_overlap import format_group
@@ -22,8 +24,29 @@ from simpipe.tuning.sweep import run_sweep, sweep_configs
 from simpipe.viz.gantt import format_gantt_detailed_info, write_gantt_svg
 
 
-def _load_config_with_profiled_defaults(config: str) -> SimConfig:
-    data = yaml.safe_load(Path(config).read_text()) or {}
+_MOCK_TIME_KEYS = (
+    "layer_time", "layer_f_time", "layer_b_time", "layer_w_time", "pattern",
+)
+
+
+def _config_from_data(data: dict) -> SimConfig:
+    """SimConfig from a parsed YAML dict; profiled presets fill model fields.
+
+    When the YAML does not set ``profiled_data`` explicitly, it is inferred:
+    mock timings, an external profile path, or a registry profile for the
+    model name all enable per-layer profiled times.  An explicit ``false``
+    keeps the analytic timing formulas.
+    """
+    if "profiled_data" not in data:
+        md = data.get("model") or {}
+        name = md.get("name")
+        inferred = (
+            name == MOCK_MODEL_NAME
+            or any(md.get(k) is not None for k in _MOCK_TIME_KEYS)
+            or bool(md.get("profile_times_path"))
+            or bool(name and profile_data(name))
+        )
+        data = {**data, "profiled_data": inferred}
     if data.get("profiled_data"):
         model_data = data.get("model") or {}
         model_name = model_data.get("name")
@@ -32,8 +55,29 @@ def _load_config_with_profiled_defaults(config: str) -> SimConfig:
                 **data,
                 "model": {**preset_model_data(model_name), **model_data},
             }
-            return SimConfig.from_dict(data)
-    return load_config(config)
+    return SimConfig.from_dict(data)
+
+
+def _load_config_with_profiled_defaults(config: str) -> SimConfig:
+    return _config_from_data(yaml.safe_load(Path(config).read_text()) or {})
+
+
+def _profile_times_for_config(cfg: SimConfig):
+    """ProfileTimes for a config (mock, external YAML, or registry), or None."""
+    if not cfg.profiled_data:
+        return None
+    if uses_mock_times(cfg.model):
+        pt = mock_profile_times(cfg.model)
+    elif cfg.model.profile_times_path:
+        from simpipe.models.profile_times import profile_times_from_preset
+
+        data = yaml.safe_load(Path(cfg.model.profile_times_path).read_text())
+        pt = profile_times_from_preset(data).slice_layers(cfg.model.num_layers)
+    else:
+        pt = get_profile_times(cfg.model.name).slice_layers(cfg.model.num_layers)
+    if cfg.model.recompute:
+        pt = pt.with_full_recompute()
+    return pt
 
 
 def _load_run_inputs(config: str | None, model: str, schedule: str | None):
@@ -44,25 +88,24 @@ def _load_run_inputs(config: str | None, model: str, schedule: str | None):
         cfg.profiled_data = True
     if schedule is not None:
         cfg.schedule = schedule
-    if not cfg.profiled_data:
-        return cfg, None
-    if uses_mock_times(cfg.model):
-        pt = mock_profile_times(cfg.model)
-        if cfg.model.recompute:
-            pt = pt.with_full_recompute()
-        return cfg, pt
-    if cfg.model.profile_times_path:
-        from simpipe.models.profile_times import profile_times_from_preset
+    return cfg, _profile_times_for_config(cfg)
 
-        data = yaml.safe_load(Path(cfg.model.profile_times_path).read_text())
-        pt = profile_times_from_preset(data).slice_layers(cfg.model.num_layers)
-        if cfg.model.recompute:
-            pt = pt.with_full_recompute()
-        return cfg, pt
-    pt = get_profile_times(cfg.model.name).slice_layers(cfg.model.num_layers)
-    if cfg.model.recompute:
-        pt = pt.with_full_recompute()
-    return cfg, pt
+
+def _build_executor(cfg: SimConfig, profile):
+    return build_simulation(
+        cfg,
+        layer_f_times=profile.layer_f if profile else None,
+        layer_b_times=profile.layer_b if profile else None,
+        layer_w_times=profile.layer_w if profile else None,
+        embedding_f_time=profile.embedding_f if profile else None,
+        embedding_b_time=profile.embedding_b if profile else None,
+        embedding_w_time=profile.embedding_w if profile else None,
+        head_f_time=profile.head_f if profile else None,
+        head_b_time=profile.head_b if profile else None,
+        head_w_time=profile.head_w if profile else None,
+        partition_layers=cfg.partition_layers,
+        placement=cfg.placement,
+    )
 
 
 @click.group()
@@ -90,20 +133,7 @@ def run_cmd(
 ) -> None:
     cfg, profile = _load_run_inputs(config, model, schedule)
 
-    executor = build_simulation(
-        cfg,
-        layer_f_times=profile.layer_f if profile else None,
-        layer_b_times=profile.layer_b if profile else None,
-        layer_w_times=profile.layer_w if profile else None,
-        embedding_f_time=profile.embedding_f if profile else None,
-        embedding_b_time=profile.embedding_b if profile else None,
-        embedding_w_time=profile.embedding_w if profile else None,
-        head_f_time=profile.head_f if profile else None,
-        head_b_time=profile.head_b if profile else None,
-        head_w_time=profile.head_w if profile else None,
-        partition_layers=cfg.partition_layers,
-        placement=cfg.placement,
-    )
+    executor = _build_executor(cfg, profile)
     if cfg.schedule == "octopipe" and cfg.tuning.auto_tune and cfg.partition_layers is None:
         click.echo(f"Auto-tuned partition: {executor.plan.partition.layer_counts(executor.graph)}")
         click.echo(f"Auto-tuned placement: {executor.plan.placement.device_stages}")
@@ -153,13 +183,16 @@ def run_cmd(
                 f"{bo.trials} sims; slot k runs input microbatch order[k])"
             )
     result = executor.run()
+    # dp replicas duplicate every block on the same device rows with mids
+    # offset by dp_idx * nmb; show/export/analyze the first replica only.
+    records = first_replica_records(result.records, cfg.parallel.micro_batch_num)
     out = Path(output)
     out.mkdir(parents=True, exist_ok=True)
     sched_label = cfg.schedule
     partition_layers = executor.plan.partition.layer_counts(executor.graph)
     placement = executor.plan.placement.device_stages
     write_gantt_svg(
-        result.records,
+        records,
         out / "pipeline_gantt.svg",
         title=f"{cfg.model.name} {sched_label}",
         partition_layers=partition_layers,
@@ -168,7 +201,7 @@ def run_cmd(
     )
     (out / "detailed_info.md").write_text(
         format_gantt_detailed_info(
-            result.records,
+            records,
             partition_layers=partition_layers,
             placement=placement,
         )
@@ -177,10 +210,10 @@ def run_cmd(
         out / "pipeline_config.yaml",
         executor=executor,
         makespan=result.makespan,
-        scheduling_records=result.records,
+        scheduling_records=records,
         memory=result.memory.to_dict() if result.memory else None,
     )
-    stats = analyze_pipeline_comp_bubble(result.records, device_num=cfg.parallel.pp_size)
+    stats = analyze_pipeline_comp_bubble(records, device_num=cfg.parallel.pp_size)
     click.echo(f"Makespan: {result.makespan}")
     click.echo(f"Bubble ratio: {stats.avg_bubble_ratio(cfg.parallel.pp_size):.2%}")
     if result.memory:
@@ -196,6 +229,16 @@ def run_cmd(
                 f"p2p={device.p2p_buffer_bytes / 1024**3:.2f}) {status}"
             )
     click.echo(f"Results written to {out}")
+
+
+@main.command("web")
+@click.option("--host", default="0.0.0.0", show_default=True)
+@click.option("--port", default=8080, show_default=True, type=int)
+def web_cmd(host: str, port: int) -> None:
+    """Serve the interactive web UI (edit config, run, export SVG/config)."""
+    from simpipe.web.server import serve
+
+    serve(host=host, port=port)
 
 
 @main.command("sweep")

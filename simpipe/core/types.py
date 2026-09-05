@@ -69,46 +69,56 @@ class WorkloadConstraint:
 
 
 class OrderedQueue:
+    """Ready queue with one heap per workload type.
+
+    The type order only decides which bucket pops first, so changing it
+    (OctoPipe flips between B-first and F-first after every workload when
+    switch_workload_type is on) is O(1) instead of rebuilding one big heap
+    whose keys embed the type rank.  Within a type the order never changes:
+    B drains the deepest stage first, everything else runs by (mid, sid).
+    One workload per (mid, sid, type) makes keys unique; the insertion
+    counter stays as a defensive tie-break.
+    """
+
     def __init__(self, type_order: list[WorkloadType]):
-        self._heap: list = []
+        self._heaps: dict[WorkloadType, list] = {}
         self._counter = 0
-        self.last_type_order = list(type_order)
-        self.type_priority = {t: i for i, t in enumerate(type_order)}
+        self._order: tuple[WorkloadType, ...] = tuple(type_order)
 
     def set_type_order(self, type_order: list[WorkloadType]) -> None:
-        if type_order == self.last_type_order:
-            return
-        self.last_type_order = list(type_order)
-        self.type_priority = {t: i for i, t in enumerate(type_order)}
-        new_heap = []
-        for _, workload in self._heap:
-            new_heap.append((self._key(workload), workload))
-        heapq.heapify(new_heap)
-        self._heap = new_heap
+        self._order = tuple(type_order)
 
     def _key(self, workload):
-        type_rank = self.type_priority.get(workload.wtype, 999)
         if workload.wtype == WorkloadType.B:
-            return (type_rank, -workload.sid, workload.mid, self._counter)
-        return (type_rank, workload.mid, workload.sid, self._counter)
+            return (-workload.sid, workload.mid, self._counter)
+        return (workload.mid, workload.sid, self._counter)
 
     def push(self, workload) -> None:
-        key = self._key(workload)
+        heap = self._heaps.setdefault(workload.wtype, [])
+        heapq.heappush(heap, (self._key(workload), workload))
         self._counter += 1
-        heapq.heappush(self._heap, (key, workload))
+
+    def _next_heap(self) -> list | None:
+        for t in self._order:
+            heap = self._heaps.get(t)
+            if heap:
+                return heap
+        # types outside the current order rank last (legacy rank-999 slot)
+        for t, heap in self._heaps.items():
+            if heap and t not in self._order:
+                return heap
+        return None
 
     def pop(self):
-        if not self._heap:
-            return None
-        return heapq.heappop(self._heap)[1]
+        heap = self._next_heap()
+        return heapq.heappop(heap)[1] if heap else None
 
     def peek(self):
-        if not self._heap:
-            return None
-        return self._heap[0][1]
+        heap = self._next_heap()
+        return heap[0][1] if heap else None
 
     def __bool__(self) -> bool:
-        return bool(self._heap)
+        return any(self._heaps.values())
 
     def __len__(self) -> int:
-        return len(self._heap)
+        return sum(len(heap) for heap in self._heaps.values())

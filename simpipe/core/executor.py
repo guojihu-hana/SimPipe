@@ -113,6 +113,16 @@ class Executor:
         )
 
 
+def first_replica_records(records: list[dict], micro_batch_num: int) -> list[dict]:
+    """Records of the first data-parallel replica (mids 0..nmb-1).
+
+    DP replicas repeat the same schedule with mids offset by dp_idx * nmb
+    and their records share device ids, so plots and bubble stats would
+    show every block dp_size times; one copy carries all the information.
+    """
+    return [r for r in records if int(r["mid"]) < micro_batch_num]
+
+
 def build_simulation(
     config: SimConfig,
     layer_f_times: list[float] | None = None,
@@ -165,10 +175,15 @@ def build_simulation(
     ):
         from simpipe.tuning.octopipe_tune import tune_octopipe
 
+        # Without per-layer profile times the partition search would index
+        # an empty list; uniform times make the search fall back to an even
+        # split (tune-only: the workload plan keeps its analytic timings).
+        tune_f = layer_f_times or [1.0] * config.model.num_layers
+        tune_b = layer_b_times or [1.0] * config.model.num_layers
         tuned = tune_octopipe(
             raw_config,
-            layer_f_times or [],
-            layer_b_times or [],
+            tune_f,
+            tune_b,
             layer_w_times,
             config.tuning,
             embedding_f_time=embedding_f_time,

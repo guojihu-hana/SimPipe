@@ -8,7 +8,11 @@ import yaml
 
 from simpipe.config.model import ModelConfig
 from simpipe.config.sim_config import SimConfig
-from simpipe.models.pattern import stack_layer_count, stack_layer_symbols
+from simpipe.models.pattern import (
+    expand_pattern,
+    stack_layer_count,
+    stack_layer_symbols,
+)
 from simpipe.models.profile_times import ProfileTimes, profile_times_from_preset
 
 # Fitted per-model layer times (pattern + per-symbol f/b/w ms) live in
@@ -145,10 +149,13 @@ def stack_layer_symbols_for_model(name: str, num_layers: int) -> list[str] | Non
 def layer_symbols_for_model_config(model: ModelConfig) -> list[str] | None:
     """Per-layer pattern symbols for a model config, best effort.
 
-    Sources in priority order: the profile_times_path YAML pattern, the HF
-    config hybrid_override_pattern, then the registry profile/preset pattern.
-    Returns None when no pattern is known (e.g. pure-transformer models).
+    Sources in priority order: the inline model.pattern (mock), the
+    profile_times_path YAML pattern, the HF config hybrid_override_pattern,
+    then the registry profile/preset pattern.  Returns None when no pattern
+    is known (e.g. pure-transformer models).
     """
+    if model.pattern:
+        return stack_layer_symbols(expand_pattern(model.pattern))[: model.num_layers]
     if model.profile_times_path:
         try:
             data = yaml.safe_load(Path(model.profile_times_path).expanduser().read_text())
@@ -189,16 +196,50 @@ def uses_mock_times(model: ModelConfig) -> bool:
             model.layer_f_time,
             model.layer_b_time,
             model.layer_w_time,
+            model.pattern,
         )
     )
 
 
 def mock_profile_times(model: ModelConfig) -> ProfileTimes:
-    """Uniform synthetic layer times from inline model config.
+    """Synthetic layer times from inline model config.
 
-    layer_time sets f=b=w (1:1:1 default); layer_f/b/w_time override
-    individual passes (B and W fall back to F).  Embedding/head cost 0.
+    With model.pattern set, per-symbol forward/backward/weight_ms tables
+    (profiles/ JSON semantics, ms) drive the times; backward defaults to
+    forward, weight to backward, and E/L to 0.  Otherwise layer_time sets
+    a uniform f=b=w (layer_f/b/w_time override individual passes) in
+    0.01 ms ticks with embedding/head cost 0.
     """
+    if model.pattern:
+        # Times are always ms here (converted to 0.01 ms ticks explicitly);
+        # profiles-JSON loading instead uses the normalize_timing_value
+        # heuristic where integers already mean ticks.
+        expanded = expand_pattern(model.pattern)
+        fwd = {"E": 0.0, "L": 0.0, **(model.forward_ms or {})}
+        bwd = {**fwd, **(model.backward_ms or {})}
+        wgt = {**bwd, **(model.weight_ms or {})}
+        body = stack_layer_symbols(expanded)
+        if len(body) != model.num_layers:
+            raise ValueError(
+                f"model.pattern has {len(body)} body layers but num_layers is "
+                f"{model.num_layers}"
+            )
+        def ticks(table: dict, sym: str) -> float:
+            if sym not in table:
+                raise ValueError(f"model.forward_ms is missing pattern type {sym!r}")
+            return float(table[sym]) * 100.0
+
+        return ProfileTimes(
+            layer_f=[ticks(fwd, s) for s in body],
+            layer_b=[ticks(bwd, s) for s in body],
+            layer_w=[ticks(wgt, s) for s in body],
+            embedding_f=ticks(fwd, "E"),
+            embedding_b=ticks(bwd, "E"),
+            embedding_w=ticks(wgt, "E"),
+            head_f=ticks(fwd, "L"),
+            head_b=ticks(bwd, "L"),
+            head_w=ticks(wgt, "L"),
+        )
     f = model.layer_f_time
     if f is None:
         f = model.layer_time if model.layer_time is not None else MOCK_DEFAULT_LAYER_TIME
