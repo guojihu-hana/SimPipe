@@ -1,0 +1,39 @@
+# Default demo: synthetic pipeline with a layer pattern.
+#
+# - pattern ET*32L = embedding + 32 transformer layers + head ("X*N" repeats)
+# - per-type times in ms: T forward = 1 ms, F : B : W = 1 : 1 : 1
+#   (backward_ms defaults to forward_ms, weight_ms to backward_ms, E/L to 0)
+# - 32 layers / pp_size 8 -> 4 layers per stage -> stage F = 4 ms
+# - p2p_latency_ms 0.4 ms = 10% of a stage forward (communication)
+# - batch: off (all 16 microbatches identical)
+schedule: 1f1b
+profiled_data: true
+time_limit: 20000000
+
+model:
+  name: mock_model
+  num_layers: 32
+  pattern: ET*32L
+  forward_ms:
+    T: 1.0
+
+parallel:
+  pp_size: 8
+  micro_batch_num: 16
+
+hardware:
+  p2p_latency_ms: 0.4      # cross-stage transfer = 10% of stage forward time
+
+# Variable-length microbatches are OFF here.  To enable, add a batch section
+# with exactly ONE of the two specs, sized to micro_batch_num:
+#
+# batch:
+#   mode: pack             # pack | pad
+#   microbatches:          # one line per microbatch (16 lines for nmb=16)
+#   - [4096]
+#   - [2048, 2048]
+#   ...
+#
+# batch:
+#   mode: pack
+#   time_scales: [1, 1, 1.2, 1.2, 1.5, 1.5, 1, 1, 1, 1, 2, 2, 1, 1, 0.8, 0.8]

@@ -31,6 +31,14 @@ class ModelConfig:
     layer_f_time: float | None = None
     layer_b_time: float | None = None
     layer_w_time: float | None = None
+    # Mock pattern timing: layer pattern (run-length syntax allowed, e.g.
+    # "ET*32L") with per-symbol times in ms, like the profiles/ JSON format.
+    # backward_ms defaults to forward_ms, weight_ms to backward_ms; E/L
+    # default to 0.  Takes precedence over the uniform layer_time fields.
+    pattern: str | None = None
+    forward_ms: dict | None = None
+    backward_ms: dict | None = None
+    weight_ms: dict | None = None
     flash_attention: bool = True
     # Full activation recompute: backward re-runs forward first, so each
     # checkpointed body layer costs f+b in the backward pass (emb/head excluded).

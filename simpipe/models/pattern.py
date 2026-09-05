@@ -88,6 +88,32 @@ def stack_layer_symbols(pattern: str) -> list[str]:
     return symbols
 
 
+def expand_pattern(pattern: str) -> str:
+    """Expand run-length syntax: "ET*32L" -> "E" + "T"*32 + "L".
+
+    A '*' directly followed by digits repeats the previous character; a '*'
+    not followed by digits is the attention symbol.  Digits are not valid
+    pattern characters, so the grammar is unambiguous.
+    """
+    import re
+
+    def repl(m: "re.Match[str]") -> str:
+        return m.group(1) * int(m.group(2))
+
+    return re.sub(r"(.)\*(\d+)", repl, pattern)
+
+
+def compress_pattern(pattern: str) -> str:
+    """Run-length encode long same-symbol runs ("E" + 32*"T" + "L" -> "ET*32L")."""
+    import re
+
+    return re.sub(
+        r"((.)\2{2,})",
+        lambda m: f"{m.group(2)}*{len(m.group(1))}",
+        pattern,
+    )
+
+
 def tokenize_pattern(pattern: str) -> list[str]:
     """Parse all layer symbols from the pattern string."""
     symbols: list[str] = []

@@ -37,6 +37,42 @@ def test_mock_times_apply_to_any_model_name() -> None:
         mock_profile_times(ModelConfig(name="mock_model", layer_f_time=0))
 
 
+def test_mock_pattern_per_type_times() -> None:
+    # "ET*3ML": run-length T*3 expands; times are ms -> 0.01 ms ticks (x100).
+    model = ModelConfig(
+        name="mock_model",
+        num_layers=4,
+        pattern="ET*3ML",
+        forward_ms={"T": 1.0, "M": 0.5},
+        backward_ms={"T": 2.0, "M": 1.0},
+        weight_ms={"T": 0.25, "M": 0.125},
+    )
+    pt = mock_profile_times(model)
+    assert pt.layer_f == [100.0, 100.0, 100.0, 50.0]
+    assert pt.layer_b == [200.0, 200.0, 200.0, 100.0]
+    assert pt.layer_w == [25.0, 25.0, 25.0, 12.5]
+    assert pt.embedding_f == 0.0 and pt.head_f == 0.0  # E/L default to 0
+
+
+def test_mock_pattern_defaults_and_validation() -> None:
+    # backward defaults to forward, weight to backward
+    pt = mock_profile_times(
+        ModelConfig(name="mock_model", num_layers=2, pattern="ETT",
+                    forward_ms={"T": 1.0})
+    )
+    assert pt.layer_b == pt.layer_f == pt.layer_w == [100.0, 100.0]
+    with pytest.raises(ValueError, match="num_layers"):
+        mock_profile_times(
+            ModelConfig(name="mock_model", num_layers=5, pattern="ET*8L",
+                        forward_ms={"T": 1.0})
+        )
+    with pytest.raises(ValueError, match="missing pattern type"):
+        mock_profile_times(
+            ModelConfig(name="mock_model", num_layers=2, pattern="EMML",
+                        forward_ms={"T": 1.0})
+        )
+
+
 def _write_config(tmp_path, extra_model: str = "", extra: str = "") -> str:
     path = tmp_path / "mock.yaml"
     path.write_text(
