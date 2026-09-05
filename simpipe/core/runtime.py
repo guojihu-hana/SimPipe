@@ -50,6 +50,8 @@ class PipelineRuntime:
         # cover every instant the pipeline state can change, so _next_tick
         # pops the heap instead of rescanning every workload's ready_time.
         self._event_heap: list[int] = []
+        # set once the first B starts; replaces scanning execution records
+        self._backward_started = False
         # Activation-memory admission control: block F launches that would
         # push a device's in-flight activations (layer*microbatch; allocated
         # at F start, freed when B and W both finish) over the cap.  The
@@ -178,6 +180,8 @@ class PipelineRuntime:
         heapq.heappush(self._event_heap, int(math.ceil(end)))
         if workload.comm_time:
             heapq.heappush(self._event_heap, int(math.ceil(end + workload.comm_time)))
+        if workload.wtype == WorkloadType.B:
+            self._backward_started = True
         if not self.max_inflight_layers or workload.wtype != WorkloadType.F:
             return
         sid = workload.sid
@@ -220,13 +224,7 @@ class PipelineRuntime:
         return 0
 
     def has_started_backward(self) -> bool:
-        for device in self.devices:
-            if device.current_workload and device.current_workload.wtype == WorkloadType.B:
-                return True
-            for workload in device.workload_execute_record:
-                if workload.wtype == WorkloadType.B:
-                    return True
-        return False
+        return self._backward_started
 
     def is_overlap_exempt(self, workload: Workload) -> bool:
         mode = self.overlap_exempt_group_by.lower().replace("+", "_").replace("-", "_")
