@@ -109,8 +109,9 @@ def resolve_partition_layers(
     if schedule in _multi_chunk_schedules():
         stage_num = pp.device_num * pp.chunk_num
         return balanced_layer_partition(config.model.num_layers, stage_num)
-    per_stage = config.model.num_layers // pp.device_num
-    return [per_stage] * pp.device_num
+    # balanced split also when num_layers is not divisible by device_num
+    # (floor division would leave trailing layers uncovered and fail).
+    return balanced_layer_partition(config.model.num_layers, pp.device_num)
 
 
 def split_layer_times_for_zbh(

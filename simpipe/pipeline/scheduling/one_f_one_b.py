@@ -21,10 +21,21 @@ class OneFOneBStrategy(ScheduleStrategy):
         mid_offset = ctx.mid_offset
 
         for did in range(ctx.device_num):
+            # The schedule references the stage actually placed on this device;
+            # the warmup depth follows the stage's pipeline position, so any
+            # one-stage-per-device placement (e.g. swapped ranks) works.
+            sids = ctx.placement.device_stages[did]
+            if len(sids) != 1:
+                raise ValueError(
+                    f"1f1b/bapar schedules one stage per device, but device "
+                    f"{did} holds stages {sids}; use interleaved or octopipe for "
+                    "multi-stage placements"
+                )
+            sid = sids[0]
             mids = [0] * workload_type_num
             # Warmup: inject forward passes
-            while mids[0] < min(ctx.device_num - did, ctx.micro_batch_num):
-                schedule[did].append((WorkloadType.F, mids[0] + mid_offset, did))
+            while mids[0] < min(ctx.stage_num - sid, ctx.micro_batch_num):
+                schedule[did].append((WorkloadType.F, mids[0] + mid_offset, sid))
                 mids[0] += 1
 
             it = 0
@@ -34,7 +45,7 @@ class OneFOneBStrategy(ScheduleStrategy):
                 slot = idx_map[next_wtype]
                 next_mid = mids[slot]
                 if next_mid < ctx.micro_batch_num:
-                    schedule[did].append((next_wtype, next_mid + mid_offset, did))
+                    schedule[did].append((next_wtype, next_mid + mid_offset, sid))
                     mids[slot] += 1
                 else:
                     finish_flag[slot] = 1
