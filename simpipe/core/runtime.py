@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import math
 
 from simpipe.config.hardware import HardwareConfig
@@ -43,6 +44,12 @@ class PipelineRuntime:
         self.workload_execute_record: list[list[Workload]] = [
             [] for _ in range(self.device_num)
         ]
+        # Future wake-up ticks for run_discrete, registered when a workload
+        # starts: its end (completion, same-device release) and end+comm
+        # (cross-device release lands after the P2P latency).  Together these
+        # cover every instant the pipeline state can change, so _next_tick
+        # pops the heap instead of rescanning every workload's ready_time.
+        self._event_heap: list[int] = []
         # Activation-memory admission control: block F launches that would
         # push a device's in-flight activations (layer*microbatch; allocated
         # at F start, freed when B and W both finish) over the cap.  The
@@ -159,6 +166,10 @@ class PipelineRuntime:
         )
 
     def on_workload_started(self, workload: Workload) -> None:
+        end = workload.end_time or 0.0
+        heapq.heappush(self._event_heap, int(math.ceil(end)))
+        if workload.comm_time:
+            heapq.heappush(self._event_heap, int(math.ceil(end + workload.comm_time)))
         if not self.max_inflight_layers or workload.wtype != WorkloadType.F:
             return
         sid = workload.sid
@@ -286,21 +297,13 @@ class PipelineRuntime:
         return self.time
 
     def _next_tick(self, time_limit: int) -> int:
+        heap = self._event_heap
         t0 = self.time
-        ticks: set[int] = set()
-        for device in self.devices:
-            if device.current_workload and device.current_workload.end_time:
-                et = int(math.ceil(device.current_workload.end_time))
-                if et > t0:
-                    ticks.add(et)
-            for stage in device.stages.values():
-                for wmap in stage.workloads.values():
-                    for w in wmap.values():
-                        if w.ready_time > t0:
-                            ticks.add(int(w.ready_time))
-        if not ticks:
+        while heap and heap[0] <= t0:
+            heapq.heappop(heap)
+        if not heap:
             return min(t0 + 1, time_limit + 1)
-        return min(min(ticks), time_limit + 1)
+        return min(heap[0], time_limit + 1)
 
     def collect_results(self) -> dict:
         records = []
