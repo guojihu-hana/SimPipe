@@ -19,10 +19,52 @@ def test_unprofiled_stage_timing_uses_equal_f_b_w():
         assert timing.f_time == timing.b_time == timing.w_time
 
 
-def test_yaml_configs_do_not_use_profiled_data_by_default(tmp_path):
-    cfg_path = tmp_path / "config.yaml"
+def test_profiled_data_inferred_from_model(tmp_path):
+    """Without an explicit profiled_data key it is inferred from the model."""
+    from simpipe.cli import _load_run_inputs
+
+    # a model with a registry profile enables profiled timings
+    cfg_path = tmp_path / "profiled.yaml"
     cfg_path.write_text(
         """
+model:
+  name: nemotron-h-4B
+parallel:
+  pp_size: 2
+  micro_batch_num: 2
+  bwd_split: true
+schedule: octopipe
+"""
+    )
+    cfg, profile = _load_run_inputs(str(cfg_path), "nemotron-h-4B", None)
+    assert cfg.profiled_data is True
+    assert profile is not None
+
+    # a model without profile data keeps the analytic formulas
+    cfg_path = tmp_path / "analytic.yaml"
+    cfg_path.write_text(
+        """
+model:
+  name: gpt
+  num_layers: 4
+  hidden_size: 256
+  num_attention_heads: 4
+  seq_len: 512
+parallel:
+  pp_size: 2
+  micro_batch_num: 2
+schedule: 1f1b
+"""
+    )
+    cfg, profile = _load_run_inputs(str(cfg_path), "gpt", None)
+    assert cfg.profiled_data is False
+    assert profile is None
+
+    # an explicit false wins over the inference
+    cfg_path = tmp_path / "explicit.yaml"
+    cfg_path.write_text(
+        """
+profiled_data: false
 model:
   name: nemotron-h-4B
   num_layers: 4
@@ -36,11 +78,7 @@ parallel:
 schedule: octopipe
 """
     )
-
-    from simpipe.cli import _load_run_inputs
-
     cfg, profile = _load_run_inputs(str(cfg_path), "nemotron-h-4B", None)
-
     assert cfg.profiled_data is False
     assert profile is None
 
