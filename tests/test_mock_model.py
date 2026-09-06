@@ -38,7 +38,9 @@ def test_mock_times_apply_to_any_model_name() -> None:
 
 
 def test_mock_pattern_per_type_times() -> None:
-    # "ET*3ML": run-length T*3 expands; times are ms -> 0.01 ms ticks (x100).
+    # "ET*3ML": run-length T*3 expands; times are ms -> 0.01 ms ticks (x100),
+    # rounded to whole ticks exactly like profiles-JSON loading, so a mock
+    # aligned to a profiled model reproduces its makespan bit for bit.
     model = ModelConfig(
         name="mock_model",
         num_layers=4,
@@ -50,7 +52,7 @@ def test_mock_pattern_per_type_times() -> None:
     pt = mock_profile_times(model)
     assert pt.layer_f == [100.0, 100.0, 100.0, 50.0]
     assert pt.layer_b == [200.0, 200.0, 200.0, 100.0]
-    assert pt.layer_w == [25.0, 25.0, 25.0, 12.5]
+    assert pt.layer_w == [25.0, 25.0, 25.0, 12.0]  # round(12.5) -> 12
     assert pt.embedding_f == 0.0 and pt.head_f == 0.0  # E/L default to 0
 
 

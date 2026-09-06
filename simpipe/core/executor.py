@@ -2,16 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from simpipe.config.hardware import HardwareConfig
-from simpipe.config.parallel import ParallelConfig
 from simpipe.config.sim_config import SimConfig
 from simpipe.core.runtime import PipelineRuntime
 from simpipe.core.types import Schedule
-from simpipe.core.types import WorkloadType
 from simpipe.graph.model_graph import ModelGraph
 from simpipe.memory.estimate import PipelineMemoryEstimate, estimate_pipeline_memory
-from simpipe.pipeline.partition import OperatorPartition, layer_partition_to_stage_specs
-from simpipe.pipeline.placement import Placement
+from simpipe.pipeline.partition import layer_partition_to_stage_specs
 from simpipe.pipeline.schedule_config import (
     apply_schedule_config,
     resolve_partition_layers,
