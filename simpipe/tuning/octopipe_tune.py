@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import multiprocessing
+import os
 from dataclasses import dataclass, field
 
 from simpipe.config.sim_config import SimConfig
@@ -249,36 +251,36 @@ def tune_octopipe(
     pending_jobs.sort(key=lambda job: (job[0], job[1], 0 if job[5] else 1))
     eval_budget = max(tuning.sim_k, tuning.result_top_k)
     eval_jobs = _select_eval_jobs(pending_jobs, eval_budget)
-    candidates: list[TuneCandidateAnalysis] = []
-    seen: set[tuple[tuple[int, ...], tuple[tuple[int, ...], ...]]] = set()
 
-    for part_variance, _proxy, partition, placement, stage_num, _is_interleaved in eval_jobs:
+    dedup_jobs: list[tuple[list[int], list[list[int]], int]] = []
+    seen: set[tuple[tuple[int, ...], tuple[tuple[int, ...], ...]]] = set()
+    for _part_variance, _proxy, partition, placement, stage_num, _is_interleaved in eval_jobs:
         key = (tuple(partition), _placement_key(placement))
         if key in seen:
             continue
         seen.add(key)
         chunk = -(-stage_num // pp.device_num)  # ceil: max stages on any device
+        dedup_jobs.append((partition, placement, chunk))
+
+    eval_args = [
+        (config, partition, placement, layer_f_times, layer_b_times,
+         layer_w_times, tuning, chunk, emb)
+        for partition, placement, chunk in dedup_jobs
+    ]
+    # Candidate simulations are independent; fan out across cores.  Results
+    # come back in submission order, so the stable makespan sort below sees
+    # the same sequence as the sequential loop did.
+    results = _run_eval_jobs(eval_args)
+
+    candidates: list[TuneCandidateAnalysis] = []
+    for (partition, placement, chunk), (makespan, overlap_exempt, trials, comp_bubble, score) in zip(
+        dedup_jobs, results
+    ):
         stage_times = stage_times_for_partition(
             layer_f_times,
             layer_b_times,
             layer_w_times,
             partition,
-            embedding_f_time=emb[0],
-            embedding_b_time=emb[1],
-            embedding_w_time=emb[2],
-            head_f_time=emb[3],
-            head_b_time=emb[4],
-            head_w_time=emb[5],
-        )
-        makespan, _records, overlap_exempt, trials, comp_bubble, score = _evaluate_candidate(
-            config,
-            partition,
-            placement,
-            layer_f_times,
-            layer_b_times,
-            layer_w_times,
-            tuning,
-            chunk_num=chunk,
             embedding_f_time=emb[0],
             embedding_b_time=emb[1],
             embedding_w_time=emb[2],
@@ -337,6 +339,52 @@ def tune_octopipe(
         bubble_overlap_trials=list(best.bubble_overlap_trials),
         top_results=top_results,
     )
+
+
+def _eval_job(args: tuple) -> tuple:
+    """Pool worker: evaluate one (partition, placement) candidate.
+
+    Drops the record list before returning so only small results cross the
+    process boundary.
+    """
+    (config, partition, placement, layer_f_times, layer_b_times,
+     layer_w_times, tuning, chunk, emb) = args
+    makespan, _records, overlap_exempt, trials, comp_bubble, score = _evaluate_candidate(
+        config,
+        partition,
+        placement,
+        layer_f_times,
+        layer_b_times,
+        layer_w_times,
+        tuning,
+        chunk_num=chunk,
+        embedding_f_time=emb[0],
+        embedding_b_time=emb[1],
+        embedding_w_time=emb[2],
+        head_f_time=emb[3],
+        head_b_time=emb[4],
+        head_w_time=emb[5],
+    )
+    return makespan, overlap_exempt, trials, comp_bubble, score
+
+
+def _run_eval_jobs(eval_args: list[tuple]) -> list[tuple]:
+    """Run candidate evaluations, in parallel when it can help.
+
+    Simulations are deterministic and independent, and results are returned
+    in input order, so the output is identical to a sequential loop.  Falls
+    back to sequential when the pool cannot start (e.g. restricted
+    environments without fork support).
+    """
+    workers = min(len(eval_args), os.cpu_count() or 1, 8)
+    if workers > 1:
+        try:
+            ctx = multiprocessing.get_context("fork")
+            with ctx.Pool(workers) as pool:
+                return pool.map(_eval_job, eval_args)
+        except (OSError, ValueError):
+            pass
+    return [_eval_job(args) for args in eval_args]
 
 
 def _placement_key(placement: list[list[int]]) -> tuple[tuple[int, ...], ...]:
