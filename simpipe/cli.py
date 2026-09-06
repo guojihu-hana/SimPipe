@@ -11,12 +11,11 @@ from simpipe.core.executor import build_simulation, first_replica_records
 from simpipe.metrics.comp_bubble import analyze_pipeline_comp_bubble
 from simpipe.models.registry import (
     MOCK_MODEL_NAME,
-    PRESETS,
     get_preset,
     get_profile_times,
     mock_profile_times,
-    preset_model_data,
     profile_data,
+    timing_model_data,
     uses_mock_times,
 )
 from simpipe.tuning.bubble_overlap import format_group
@@ -50,11 +49,9 @@ def _config_from_data(data: dict) -> SimConfig:
     if data.get("profiled_data"):
         model_data = data.get("model") or {}
         model_name = model_data.get("name")
-        if model_name in PRESETS:
-            data = {
-                **data,
-                "model": {**preset_model_data(model_name), **model_data},
-            }
+        merged = timing_model_data(model_name) if model_name else None
+        if merged is not None:
+            data = {**data, "model": {**merged, **model_data}}
     return SimConfig.from_dict(data)
 
 
