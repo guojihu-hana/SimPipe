@@ -1216,7 +1216,33 @@ $("import-file").addEventListener("change", (ev) => {
 });
 $("export-btn").addEventListener("click", async () => {
   await flushDump(); // pending form edits land in the YAML first
-  download("simpipe_config.yaml", $("config").value, "text/yaml");
+  let text = $("config").value;
+  // A profiled model is just a name that references on-disk profile data;
+  // inline its pattern + per-type times (same shape alignMockToModel makes)
+  // so the exported file runs on machines without any profiles.
+  const name = getPath(cfgObj, "model.name");
+  const lm = (DYN_OPTS.model_layers || {})[name];
+  if (name !== "mock_model" && lm && lm.pattern) {
+    const cfg = JSON.parse(JSON.stringify(cfgObj));
+    Object.assign(cfg.model, (DYN_OPTS.model_meta || {})[name] || {});
+    cfg.model.name = "mock_model";
+    for (const k of ["layer_time", "layer_f_time", "layer_b_time", "layer_w_time"])
+      delete cfg.model[k];
+    cfg.model.pattern = compressPat(lm.pattern);
+    cfg.model.forward_ms = { ...(lm.f || {}) };
+    cfg.model.backward_ms = { ...(lm.b || {}) };
+    cfg.model.weight_ms = { ...(lm.w || {}) };
+    cfg.model.num_layers = patBody(cfg.model.pattern).length;
+    try {
+      const resp = await fetch("/api/dump", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data: cfg }),
+      });
+      const r = await resp.json();
+      if (r.ok) text = r.text;
+    } catch {} // fall back to exporting the config as-is
+  }
+  download("simpipe_config.yaml", text, "text/yaml");
 });
 
 /* ================= initial config ================= */

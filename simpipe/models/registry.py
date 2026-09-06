@@ -234,7 +234,9 @@ def mock_profile_times(model: ModelConfig) -> ProfileTimes:
         def ticks(table: dict, sym: str) -> float:
             if sym not in table:
                 raise ValueError(f"model.forward_ms is missing pattern type {sym!r}")
-            return float(table[sym]) * 100.0
+            # round like profiles-JSON loading (normalize_timing_value) does,
+            # so a mock aligned to a profiled model reproduces it exactly
+            return float(round(float(table[sym]) * 100.0))
 
         return ProfileTimes(
             layer_f=[ticks(fwd, s) for s in body],
