@@ -18,11 +18,15 @@ def _placement_key(placement: list[list[int]]) -> tuple[tuple[int, ...], ...]:
     return tuple(tuple(row) for row in placement)
 
 
-def _stage_device(placement: list[list[int]], stage_id: int) -> int | None:
+def _stage_device_map(placement: list[list[int]], stage_num: int) -> list[int | None]:
+    """sid -> device id lookup table (one O(S) pass instead of scanning the
+    whole placement per stage, which made proxy scoring O(S^2 * D))."""
+    owner: list[int | None] = [None] * stage_num
     for did, stages in enumerate(placement):
-        if stage_id in stages:
-            return did
-    return None
+        for sid in stages:
+            if 0 <= sid < stage_num:
+                owner[sid] = did
+    return owner
 
 
 def _device_loads(placement: list[list[int]], stage_times: list[float]) -> list[float]:
@@ -37,13 +41,12 @@ def _load_variance(loads: list[float]) -> float:
 
 
 def _adjacent_same_device_count(placement: list[list[int]], stage_num: int) -> int:
-    count = 0
-    for sid in range(stage_num - 1):
-        d0 = _stage_device(placement, sid)
-        d1 = _stage_device(placement, sid + 1)
-        if d0 is not None and d0 == d1:
-            count += 1
-    return count
+    owner = _stage_device_map(placement, stage_num)
+    return sum(
+        1
+        for sid in range(stage_num - 1)
+        if owner[sid] is not None and owner[sid] == owner[sid + 1]
+    )
 
 
 def placement_proxy_score(
@@ -85,9 +88,10 @@ def _generate_adjacent_dispersal_variants(
     max_stage_per_device: int | None,
     add: Callable[[list[list[int]]], None],
 ) -> None:
+    owner = _stage_device_map(base, stage_num)
     for sid in range(stage_num - 1):
-        d0 = _stage_device(base, sid)
-        d1 = _stage_device(base, sid + 1)
+        d0 = owner[sid]
+        d1 = owner[sid + 1]
         if d0 is None or d1 is None or d0 != d1:
             continue
         for target in range(device_num):
