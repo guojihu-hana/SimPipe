@@ -133,9 +133,16 @@ def _model_data_from_preset(data: dict) -> dict:
     return model_data
 
 
-def preset_model_data(name: str) -> dict:
-    if name not in PRESETS:
-        raise KeyError(f"Unknown model preset: {name}")
+def timing_model_data(name: str) -> dict | None:
+    """Model fields from a preset and/or profiles/ JSON, or None.
+
+    Models that ship only a profile (no PRESETS entry, e.g. the jamba and
+    llama3 families) still get num_layers derived from the profile pattern;
+    without this a bare ``model: {name: ...}`` config would silently fall
+    back to the ModelConfig default of 32 layers.
+    """
+    if name not in PRESETS and not profile_data(name):
+        return None
     return _model_data_from_preset(_timing_data(name))
 
 
