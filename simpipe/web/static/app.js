@@ -6,13 +6,13 @@ let last = null;
 const COLS = 12, ROW_H = 84, GAP = 12;
 const LAYOUT_KEY = "simpipe_grid_v4";
 const UNLOCK_KEY = "simpipe_layout_unlocked";
-// Fixed layout: config + partition/placement editor on row 1, summary as a
-// full-width strip between them and the gantt, then per-rank stats + yaml.
+// Fixed layout: the gantt on top, config + partition/placement editor below,
+// summary as a full-width strip, then per-rank stats + yaml.
 const DEFAULT_GRID = {
-  "panel-config":    { x: 0, y: 0, w: 5, h: 6 },
-  "panel-partplace": { x: 5, y: 0, w: 7, h: 6 },
-  "panel-summary":   { x: 0, y: 6, w: 12, h: 2 },
-  "panel-gantt":     { x: 0, y: 8, w: 12, h: 5 },
+  "panel-gantt":     { x: 0, y: 0, w: 12, h: 5 },
+  "panel-config":    { x: 0, y: 5, w: 5, h: 6 },
+  "panel-partplace": { x: 5, y: 5, w: 7, h: 6 },
+  "panel-summary":   { x: 0, y: 11, w: 12, h: 2 },
   "panel-ranks":     { x: 0, y: 13, w: 7, h: 4 },
   "panel-yaml":      { x: 7, y: 13, w: 5, h: 4 },
 };
@@ -220,7 +220,7 @@ const CFG_SCHEMA = [
   { sec: "Parallel", fields: [
     { path: "parallel.pp_size", type: "int", def: 1, min: 1, max: 1024,
       desc: "Pipeline-parallel size = number of devices." },
-    { path: "parallel.tp_size", type: "int", def: 1, min: 1, max: 64,
+    { path: "parallel.tp_size", type: "int", def: 8, min: 1, max: 64,
       desc: "Tensor-parallel size; scales analytic timing and per-rank model/activation memory." },
     { path: "parallel.ep_size", type: "int", def: 1, min: 1, max: 512,
       desc: "Expert-parallel size for MoE models; shards experts across ranks." },
@@ -496,12 +496,22 @@ function onFormEdit(ev, fields) {
     el.classList.remove("invalid");
     el.title = f.desc;
     if (f.path === "model.name") applyModelMeta(val); // fill the model's values
-    if (f.path === "schedule" && val === "octopipe") {
-      // OctoPipe schedules B and W separately: switching to it turns bwd
-      // split on (still user-editable afterwards).
-      setPath(cfgObj, "parallel.bwd_split", true);
+    if (f.path === "schedule" && val !== undefined) {
+      // only OctoPipe and ZBH exploit the B/W backward split; every other
+      // schedule defaults to a whole backward (still user-editable after)
+      const wantSplit = val === "octopipe" || val === "zbh";
+      setPath(cfgObj, "parallel.bwd_split", wantSplit);
       const bs = document.querySelector('[data-path="parallel.bwd_split"]');
-      if (bs) bs.checked = true;
+      if (bs) bs.checked = wantSplit;
+      if (val === "interleaved") {
+        // interleaved defaults to the deepest chunking: one layer per stage
+        const nl = Number(getPath(cfgObj, "model.num_layers")) || 0;
+        const pp = Number(getPath(cfgObj, "parallel.pp_size")) || 1;
+        const maxChunk = Math.max(1, Math.min(256, Math.floor(nl / pp)));
+        setPath(cfgObj, "parallel.chunk_num", maxChunk);
+        const ck = document.querySelector('[data-path="parallel.chunk_num"]');
+        if (ck) ck.value = String(maxChunk);
+      }
     }
     if (f.path === "model.pattern") {
       // pattern is the source of truth for the layer count
@@ -1194,47 +1204,32 @@ function setConfigText(text) {
   if (formActive()) parseYamlToForm(true);
 }
 
-/* --- import a local YAML file --- */
+/* --- import / export a local YAML file --- */
 $("import-btn").addEventListener("click", () => $("import-file").click());
 $("import-file").addEventListener("change", (ev) => {
   const file = ev.target.files && ev.target.files[0];
   if (!file) return;
   const reader = new FileReader();
-  reader.onload = () => {
-    setConfigText(String(reader.result));
-    $("example-select").value = "";
-  };
+  reader.onload = () => setConfigText(String(reader.result));
   reader.readAsText(file);
   ev.target.value = "";
 });
+$("export-btn").addEventListener("click", async () => {
+  await flushDump(); // pending form edits land in the YAML first
+  download("simpipe_config.yaml", $("config").value, "text/yaml");
+});
 
-/* ================= examples ================= */
-async function loadExamples() {
-  const sel = $("example-select");
-  sel.innerHTML = "<option value=''>-- example configs --</option>";
+/* ================= initial config ================= */
+async function loadDefaultConfig() {
   try {
     const examples = await (await fetch("/api/examples")).json();
-    for (const ex of examples) {
-      const opt = document.createElement("option");
-      opt.value = ex.name;
-      opt.textContent = ex.name;
-      opt.dataset.content = ex.content;
-      sel.appendChild(opt);
-    }
     const preferred = examples.find(e => e.name === "mock_model.yaml")
       || examples.find(e => e.name === "varlen.yaml") || examples[0];
-    if (preferred && !$("config").value) {
-      sel.value = preferred.name;
-      $("config").value = preferred.content;
-    }
+    if (preferred && !$("config").value) $("config").value = preferred.content;
   } catch {}
   // default to the form view once the initial config is in place
   await setCfgMode("form");
 }
-$("example-select").addEventListener("change", (ev) => {
-  const opt = ev.target.selectedOptions[0];
-  if (opt && opt.dataset.content !== undefined) setConfigText(opt.dataset.content);
-});
 
 /* ================= rendering ================= */
 function renderSummary(r) {
@@ -1289,12 +1284,18 @@ function renderRanks(rows) {
 /* ================= gantt: canvas renderer + region zoom ================= */
 let gantt = null; // { data, canvas, ctx, range: [fromPct, toPct], ro }
 
-const fmtPct = (v) => `${Math.round(v * 10) / 10}%`;
+/* Deepest zoom: 0.001% of the run (~a handful of ticks on big traces). */
+const MIN_SPAN_PCT = 1e-3;
+const fmtPct = (v) => {
+  const span = gantt ? gantt.range[1] - gantt.range[0] : 100;
+  const digits = span < 0.1 ? 3 : span < 2 ? 2 : 1;
+  return `${v.toFixed(digits)}%`;
+};
 /* Single source of truth for the visible time range (percent of full span). */
 function setViewRange(fromPct, toPct) {
   if (!gantt) return;
-  fromPct = Math.max(0, Math.min(99, fromPct));
-  toPct = Math.min(100, Math.max(fromPct + 1, toPct));
+  fromPct = Math.max(0, Math.min(100 - MIN_SPAN_PCT, fromPct));
+  toPct = Math.min(100, Math.max(fromPct + MIN_SPAN_PCT, toPct));
   gantt.range = [fromPct, toPct];
   updateRangeUI();
   drawGantt();
@@ -1307,7 +1308,6 @@ function updateRangeUI() {
   const fill = $("range-fill");
   fill.style.left = f + "%";
   fill.style.width = Math.max(0, t - f) + "%";
-  $("zoom-reset").style.visibility = f > 0 || t < 100 ? "visible" : "hidden";
 }
 function onSlider(which) {
   let f = +$("range-from").value, t = +$("range-to").value;
@@ -1342,6 +1342,8 @@ $("range-fill").addEventListener("mousedown", (ev) => {
 
 const GANTT_COLORS = { F: "#E8C66A", B: "#94B8E8", W: "#8FBD8C", R: "#F8CECC" };
 const GANTT_GUTTER = 40, GANTT_AXIS_H = 22;
+/* Stable, well-spread accent per micro batch (used for pins and connectors). */
+const pathColor = (mid) => `hsl(${(mid * 61) % 360} 60% 36%)`;
 
 /* Geometry of the current view: time window + pixel mapping. */
 function ganttGeom() {
@@ -1393,6 +1395,11 @@ function drawGantt() {
     ctx.fillText(tm.toLocaleString(), x + 3, 12);
   }
 
+  // micro-batch path highlight: any number of pinned mids plus the hovered one
+  const activeMids = new Set(gantt.pinnedMids);
+  if (gantt.hoverMid != null) activeMids.add(gantt.hoverMid);
+  const anyActive = activeMids.size > 0;
+
   const bh = Math.min(g.rowH * 0.74, g.rowH - 4);
   for (let i = 0; i < data.devices.length; i++) {
     const dev = data.devices[i];
@@ -1415,6 +1422,9 @@ function drawGantt() {
       const x0 = Math.max(g.xOf(s), GANTT_GUTTER);
       const x1 = Math.min(g.xOf(e), GANTT_GUTTER + g.plotW);
       const bw = Math.max(x1 - x0, 0.75);
+      const isActive = activeMids.has(mid);
+      const dimmed = anyActive && !isActive;
+      ctx.globalAlpha = dimmed ? 0.22 : 1;
       ctx.fillStyle = GANTT_COLORS[w] || "#cccccc";
       ctx.beginPath();
       if (ctx.roundRect) ctx.roundRect(x0, y, bw, bh, Math.min(3, bw / 3));
@@ -1424,7 +1434,12 @@ function drawGantt() {
       // thresholds: hard cutoffs make text pop in and out en masse while
       // dragging the range (visible flicker around the threshold).
       const strokeA = Math.min(1, Math.max(0, (bw - 3) / 6));
-      if (strokeA > 0.04) {
+      if (isActive) {
+        ctx.strokeStyle = pathColor(mid);
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+        ctx.lineWidth = 1;
+      } else if (strokeA > 0.04) {
         ctx.strokeStyle = `rgba(15,23,42,${(0.35 * strokeA).toFixed(3)})`;
         ctx.stroke();
       }
@@ -1435,7 +1450,37 @@ function drawGantt() {
         ctx.fillText(String(mid), x0 + bw / 2, yMid);
         ctx.textAlign = "left";
       }
+      ctx.globalAlpha = 1;
     }
+  }
+
+  // dashed connectors tracing each active micro-batch through the pipeline
+  if (anyActive) {
+    const cx = (t) => Math.max(GANTT_GUTTER, Math.min(g.xOf(t), GANTT_GUTTER + g.plotW));
+    ctx.lineWidth = 1.2;
+    ctx.setLineDash([4, 3]);
+    for (const am of activeMids) {
+      const pts = [];
+      for (let i = 0; i < data.devices.length; i++) {
+        const yMid = GANTT_AXIS_H + i * g.rowH + g.rowH / 2;
+        for (const b of data.devices[i].blocks) {
+          if (b[3] === am) pts.push({ s: b[0], e: b[1], yMid });
+        }
+      }
+      pts.sort((p, q) => p.s - q.s || p.e - q.e);
+      ctx.strokeStyle = pathColor(am);
+      ctx.beginPath();
+      for (let i = 1; i < pts.length; i++) {
+        const a = pts[i - 1], b = pts[i];
+        if (b.s <= g.t0 && a.e <= g.t0) continue; // both left of the view
+        if (a.e >= g.t1 && b.s >= g.t1) continue; // both right of the view
+        ctx.moveTo(cx(a.e), a.yMid);
+        ctx.lineTo(cx(b.s), b.yMid);
+      }
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    ctx.lineWidth = 1;
   }
 }
 
@@ -1466,7 +1511,8 @@ function setupGantt(data) {
   const host = body.querySelector(".gantt-host");
   const canvas = $("gantt-canvas");
   canvas.width = 0; // force the first size() call to resize + draw
-  gantt = { data, canvas, ctx: canvas.getContext("2d"), range: [0, 100], ro: null };
+  gantt = { data, canvas, ctx: canvas.getContext("2d"), range: [0, 100], ro: null,
+            hoverX: null, hoverMid: null, pinnedMids: new Set() };
 
   function size() {
     const rect = host.getBoundingClientRect();
@@ -1487,9 +1533,12 @@ function setupGantt(data) {
   const tip = $("gantt-tip");
 
   canvas.addEventListener("mousemove", (ev) => {
+    gantt.hoverX = ev.clientX; // anchor for W/S keyboard zoom
     if (selecting) return;
     const rect = canvas.getBoundingClientRect();
     const hit = ganttHit(ev.clientX - rect.left, ev.clientY - rect.top);
+    const hoverMid = hit ? hit.b[3] : null;
+    if (hoverMid !== gantt.hoverMid) { gantt.hoverMid = hoverMid; drawGantt(); }
     if (!hit) { tip.style.display = "none"; return; }
     const [s, e, w, mid, sid] = hit.b;
     tip.textContent =
@@ -1503,14 +1552,58 @@ function setupGantt(data) {
     if (ly + th > hostRect.height) ly = Math.max(0, ev.clientY - hostRect.top - th - 10);
     tip.style.left = lx + "px"; tip.style.top = ly + "px";
   });
-  canvas.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+  canvas.addEventListener("mouseleave", () => {
+    tip.style.display = "none";
+    gantt.hoverX = null;
+    if (gantt.hoverMid != null) { gantt.hoverMid = null; drawGantt(); }
+  });
 
+  /* perfetto-style navigation: drag pans, shift+drag selects a region to
+     zoom into, wheel zooms around the cursor, horizontal wheel pans */
   canvas.addEventListener("mousedown", (ev) => {
     ev.preventDefault();
     const rect = canvas.getBoundingClientRect();
     const hostRect = host.getBoundingClientRect();
-    selecting = { startX: ev.clientX };
     tip.style.display = "none";
+
+    if (!ev.shiftKey) { // drag = pan; a no-move click (un)pins the micro batch
+      selecting = { pan: true };
+      canvas.style.cursor = "grabbing";
+      const startX = ev.clientX, startY = ev.clientY;
+      let moved = false;
+      const [f0, t0] = gantt.range;
+      const span = t0 - f0;
+      const plotW = ganttGeom().plotW;
+      function move(e) {
+        if (Math.abs(e.clientX - startX) > 3 || Math.abs(e.clientY - startY) > 3) moved = true;
+        const dPct = (-(e.clientX - startX) / plotW) * span;
+        const nf = Math.max(0, Math.min(100 - span, f0 + dPct));
+        setViewRange(nf, nf + span);
+      }
+      function up() {
+        document.removeEventListener("mousemove", move);
+        document.removeEventListener("mouseup", up);
+        selecting = null;
+        canvas.style.cursor = "";
+        if (!moved) { // click: toggle that path's pin; empty space clears all
+          const hit = ganttHit(startX - rect.left, startY - rect.top);
+          if (hit) {
+            const mid = hit.b[3];
+            if (gantt.pinnedMids.has(mid)) gantt.pinnedMids.delete(mid);
+            else gantt.pinnedMids.add(mid);
+          } else {
+            gantt.pinnedMids.clear();
+          }
+          drawGantt();
+        }
+      }
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", up);
+      return;
+    }
+
+    // shift+drag = region select-to-zoom
+    selecting = { startX: ev.clientX };
     const sel = $("select-rect");
     sel.style.left = (ev.clientX - hostRect.left) + "px";
     sel.style.width = "0px";
@@ -1536,8 +1629,100 @@ function setupGantt(data) {
     document.addEventListener("mousemove", move);
     document.addEventListener("mouseup", up);
   });
+
+  canvas.addEventListener("wheel", (ev) => {
+    ev.preventDefault(); // keep the page/panel from scrolling
+    const g = ganttGeom();
+    const [f0, t0] = gantt.range;
+    const span = t0 - f0;
+
+    // trackpad horizontal scroll (or shift+wheel) pans
+    const dx = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX
+             : ev.shiftKey ? ev.deltaY : 0;
+    if (dx !== 0) {
+      const dPct = (dx / g.plotW) * span;
+      const nf = Math.max(0, Math.min(100 - span, f0 + dPct));
+      setViewRange(nf, nf + span);
+      return;
+    }
+
+    // vertical scroll zooms, keeping the time under the cursor fixed
+    const rect = canvas.getBoundingClientRect();
+    const mx = Math.max(GANTT_GUTTER, Math.min(ev.clientX - rect.left, GANTT_GUTTER + g.plotW));
+    const anchor = f0 + ((mx - GANTT_GUTTER) / g.plotW) * span; // pct under cursor
+    const dy = ev.deltaMode === 1 ? ev.deltaY * 16 : ev.deltaY; // line -> px
+    const factor = Math.exp(dy * 0.0015); // <1 zoom in, >1 zoom out
+    const newSpan = Math.max(MIN_SPAN_PCT, Math.min(100, span * factor));
+    let nf = anchor - ((anchor - f0) / span) * newSpan;
+    nf = Math.max(0, Math.min(100 - newSpan, nf));
+    setViewRange(nf, nf + newSpan);
+  }, { passive: false });
 }
 $("zoom-reset").addEventListener("click", () => setViewRange(0, 100));
+
+$("hl-reset").addEventListener("click", () => {
+  if (!gantt) return;
+  gantt.pinnedMids.clear();
+  drawGantt();
+});
+
+/* WASD navigation (perfetto-style): W zoom in / S zoom out around the
+   hovered time (window center when the mouse is off the chart), A/D pan.
+   Held keys are animated in a rAF loop with per-frame dt, so motion is
+   smooth and independent of the OS key-repeat rate.  Keys are ignored
+   while typing in a form control. */
+const NAV_PAN_SPAN_PER_S = 1.4; // view-widths per second
+const NAV_ZOOM_PER_S = 3.5;     // zoom factor per second held
+const navKeys = new Set();
+let navRaf = null, navLastTs = 0;
+
+function navAnchorPct(f0, span) {
+  if (gantt.hoverX == null) return f0 + span / 2;
+  const g = ganttGeom();
+  const rect = gantt.canvas.getBoundingClientRect();
+  const mx = Math.max(GANTT_GUTTER, Math.min(gantt.hoverX - rect.left, GANTT_GUTTER + g.plotW));
+  return f0 + ((mx - GANTT_GUTTER) / g.plotW) * span;
+}
+
+function navStep(now) {
+  navRaf = null;
+  if (!gantt || !navKeys.size) return;
+  const dt = Math.min((now - navLastTs) / 1000, 0.05); // clamp hitchy frames
+  navLastTs = now;
+  const [f0, t0] = gantt.range;
+  const span = t0 - f0;
+  let newSpan = span, nf = f0;
+
+  let zoom = 1;
+  if (navKeys.has("w")) zoom /= NAV_ZOOM_PER_S;
+  if (navKeys.has("s")) zoom *= NAV_ZOOM_PER_S;
+  if (zoom !== 1) {
+    newSpan = Math.max(MIN_SPAN_PCT, Math.min(100, span * Math.pow(zoom, dt)));
+    const anchor = navAnchorPct(f0, span);
+    nf = anchor - ((anchor - f0) / span) * newSpan;
+  }
+  if (navKeys.has("a")) nf -= newSpan * NAV_PAN_SPAN_PER_S * dt;
+  if (navKeys.has("d")) nf += newSpan * NAV_PAN_SPAN_PER_S * dt;
+
+  nf = Math.max(0, Math.min(100 - newSpan, nf));
+  setViewRange(nf, nf + newSpan);
+  navRaf = requestAnimationFrame(navStep);
+}
+
+document.addEventListener("keydown", (ev) => {
+  if (!gantt) return;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  const k = ev.key.toLowerCase();
+  if (k !== "w" && k !== "a" && k !== "s" && k !== "d") return;
+  const t = ev.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+  ev.preventDefault();
+  if (ev.repeat) return; // the rAF loop animates held keys itself
+  navKeys.add(k);
+  if (!navRaf) { navLastTs = performance.now(); navRaf = requestAnimationFrame(navStep); }
+});
+document.addEventListener("keyup", (ev) => navKeys.delete(ev.key.toLowerCase()));
+window.addEventListener("blur", () => navKeys.clear());
 
 /* ================= run ================= */
 function showError(message, tb) {
@@ -1559,6 +1744,14 @@ async function run() {
   const btn = $("run-btn");
   btn.disabled = true; btn.textContent = "Running...";
   $("toast").style.display = "none";
+  // white veil + spinner over the gantt while the backend works; the timer
+  // ticks every 0.1s and the final time lands next to the F/B/W legend
+  const overlay = $("run-overlay"), timerEl = $("run-timer");
+  overlay.style.display = "flex";
+  const t0 = performance.now();
+  const elapsed = () => ((performance.now() - t0) / 1000).toFixed(1) + " s";
+  timerEl.textContent = "0.0 s";
+  const timerTick = setInterval(() => { timerEl.textContent = elapsed(); }, 100);
   try {
     await flushDump(); // form edits land in the YAML before running
     const resp = await fetch("/api/run", {
@@ -1577,9 +1770,12 @@ async function run() {
     $("config-out").textContent = r.pipeline_config;
     $("dl-svg").disabled = false;
     $("dl-config").disabled = false;
+    $("gen-time").textContent = "generated in " + elapsed();
   } catch (e) {
     showError("Request failed: " + e);
   } finally {
+    clearInterval(timerTick);
+    overlay.style.display = "none";
     btn.disabled = false; btn.innerHTML = "Run &#9654;";
     runInflight = false;
     if (runQueued) { runQueued = false; run(); } // latest edits win
@@ -1618,6 +1814,6 @@ $("dl-config").addEventListener("click", () => last && download("pipeline_config
 (async () => {
   await fetchOptions();   // dropdown values for model.name / profile_times_path
   buildForm();
-  await loadExamples();   // loads the default config into form + YAML
+  await loadDefaultConfig();   // loads the default config into form + YAML
   if ($("config").value.trim()) run(); // show results immediately on first visit
 })();

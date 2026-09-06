@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SimPipe</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -12,7 +13,6 @@
     <span class="mark">S</span>
     <h1>Sim<span>Pipe</span></h1>
   </div>
-  <select id="example-select" title="Load an example config"></select>
   <button class="primary" id="run-btn">Run &#9654;</button>
   <label class="chk" title="Re-run automatically after every config or partition/placement change.">
     <input type="checkbox" id="auto-rerun" checked> Auto rerun
@@ -25,6 +25,49 @@
 </div>
 <div id="board">
   <div class="ghost" id="ghost"></div>
+  <div class="panel fit" id="panel-gantt" data-panel>
+    <div class="panel-head">
+      <span class="title">Pipeline Gantt</span>
+      <span class="legend">
+        <span class="key"><i style="--c:#E8C66A"></i>F</span>
+        <span class="key"><i style="--c:#94B8E8"></i>B</span>
+        <span class="key"><i style="--c:#8FBD8C"></i>W</span>
+      </span>
+      <span class="gen-time" id="gen-time"></span>
+      <span class="spacer"></span>
+      <span class="keys-hint"><kbd>W</kbd><kbd>S</kbd> zoom &middot; <kbd>A</kbd><kbd>D</kbd> pan</span>
+      <span class="help-tip">?
+        <div class="help-pop">
+          <b>Gantt navigation</b>
+          <div class="hrow"><span class="hk">W / S</span><span>zoom in / out around the cursor (hold for smooth zoom)</span></div>
+          <div class="hrow"><span class="hk">A / D</span><span>pan left / right (hold for smooth pan)</span></div>
+          <div class="hrow"><span class="hk">Scroll</span><span>zoom around the cursor</span></div>
+          <div class="hrow"><span class="hk">Shift+scroll / &#8596; scroll</span><span>pan</span></div>
+          <div class="hrow"><span class="hk">Drag</span><span>pan the view</span></div>
+          <div class="hrow"><span class="hk">Hover a block</span><span>highlight that micro batch&#39;s full path</span></div>
+          <div class="hrow"><span class="hk">Click a block</span><span>pin / unpin that path &mdash; several can be pinned; click empty space to clear</span></div>
+          <div class="hrow"><span class="hk">Shift+drag</span><span>zoom into the selected region</span></div>
+          <div class="hrow"><span class="hk">Range bar</span><span>drag the handles to set the window, drag the middle band to pan</span></div>
+          <div class="hrow"><span class="hk">Reset zoom</span><span>back to the full 0&ndash;100% view</span></div>
+        </div>
+      </span>
+      <span id="range-label" class="range-label">0% &ndash; 100%</span>
+      <div class="dual" id="range-ctl" title="Visible time range">
+        <div class="track"></div><div class="fill" id="range-fill"></div>
+        <input type="range" id="range-from" min="0" max="100" step="1" value="0">
+        <input type="range" id="range-to" min="0" max="100" step="1" value="100">
+      </div>
+      <button class="small" id="hl-reset" title="Unpin all highlighted micro batches">Reset highlight</button>
+      <button class="small" id="zoom-reset" title="Back to the full 0&ndash;100% view">Reset zoom</button>
+      <button class="small" id="dl-svg" disabled>Download SVG</button>
+    </div>
+    <div class="panel-body" id="gantt-body"><div class="placeholder">Run a config to see the Gantt chart. Scroll to zoom around the cursor, drag to pan, Shift+drag to zoom into a region.</div></div>
+    <div class="run-overlay" id="run-overlay" style="display:none">
+      <div class="spinner"></div>
+      <div class="run-timer" id="run-timer">0.0 s</div>
+    </div>
+    <div class="resize-handle" data-resize></div>
+  </div>
   <div class="panel" id="panel-config" data-panel>
     <div class="panel-head">
       <span class="title">Config</span>
@@ -34,6 +77,7 @@
         <button data-mode="yaml">YAML</button>
       </div>
       <button class="small" id="import-btn" title="Import a local YAML config file">Import</button>
+      <button class="small" id="export-btn" title="Download the current config as a YAML file">Export</button>
       <input type="file" id="import-file" accept=".yaml,.yml,.txt" style="display:none">
     </div>
     <div class="panel-body">
@@ -58,29 +102,6 @@
   <div class="panel" id="panel-summary" data-panel>
     <div class="panel-head"><span class="title">Summary</span></div>
     <div class="panel-body" id="summary-body"><div class="placeholder">Run a config to see results.</div></div>
-    <div class="resize-handle" data-resize></div>
-  </div>
-  <div class="panel fit" id="panel-gantt" data-panel>
-    <div class="panel-head">
-      <span class="title">Pipeline Gantt</span>
-      <span class="legend">
-        <span class="key"><i style="--c:#E8C66A"></i>F</span>
-        <span class="key"><i style="--c:#94B8E8"></i>B</span>
-        <span class="key"><i style="--c:#8FBD8C"></i>W</span>
-      </span>
-      <span class="spacer"></span>
-      <span id="range-label" class="range-label">0% &ndash; 100%</span>
-      <div class="dual" id="range-ctl" title="Visible time range">
-        <div class="track"></div><div class="fill" id="range-fill"></div>
-        <input type="range" id="range-from" min="0" max="100" step="1" value="0">
-        <input type="range" id="range-to" min="0" max="100" step="1" value="100">
-      </div>
-      <!-- visibility (not display): the button always keeps its slot, so the
-           slider never shifts under the cursor when the button appears -->
-      <button class="small" id="zoom-reset" style="visibility:hidden">Reset zoom</button>
-      <button class="small" id="dl-svg" disabled>Download SVG</button>
-    </div>
-    <div class="panel-body" id="gantt-body"><div class="placeholder">Run a config to see the Gantt chart. Drag to zoom into a region; drag the range bar to pan.</div></div>
     <div class="resize-handle" data-resize></div>
   </div>
   <div class="panel" id="panel-ranks" data-panel>
