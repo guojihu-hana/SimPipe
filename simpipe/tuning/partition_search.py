@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import heapq
+
 
 def _layer_comp(
     layer_f: list[float],
@@ -114,60 +116,85 @@ def top_partitions_by_stage_variance(
         w = layer_w[i] if layer_w is not None and i < len(layer_w) else 0.0
         prefix.append(prefix[-1] + layer_f[i] + layer_b[i] + w)
 
-    # entry = (sum, sumsq, count, stage_comp, parent_entry | None)
+    # entry = (sumsq, count, stage_comp, parent_entry | None).  Every chain
+    # reaching layer position `pos` covers exactly layers [0, pos), so the
+    # running sum equals prefix[pos] plus the emb/head extras for every entry
+    # in a bucket: ranking by variance within a bucket is ranking by the sum
+    # of squares alone, and the running sum need not be carried at all.
     Entry = tuple  # recursive tuple chain
-    partial: dict[tuple[int, int], list[Entry]] = {(0, 0): [(0.0, 0.0, 0, 0.0, None)]}
+    prev: dict[int, list[Entry]] = {0: [(0.0, 0, 0.0, None)]}
 
     emb_time = embedding_f_time + embedding_b_time + embedding_w_time
     head_time = head_f_time + head_b_time + head_w_time
 
+    keep = max(top_k * 4, top_k)
     for stages_used in range(1, stage_num + 1):
-        next_partial: dict[tuple[int, int], list[Entry]] = {}
-        for (pos, prev_stages), entries in partial.items():
-            if prev_stages != stages_used - 1:
-                continue
-            remaining_layers = num_layers - pos
-            remaining_stages = stage_num - stages_used
-            max_count = remaining_layers - remaining_stages
-            base = prefix[pos]
-            extra = (emb_time if stages_used == 1 else 0.0) + (
-                head_time if stages_used == stage_num else 0.0
-            )
-            for count in range(1, max_count + 1):
-                stage_comp = prefix[pos + count] - base + extra
+        # One bounded max-heap per new position.  Iterating count upward
+        # makes the last stage's comp (hence sq) non-decreasing while parent
+        # buckets stay ascending, so three prunes apply: stop the position
+        # once sq alone exceeds the kept worst (later counts only get worse),
+        # skip a parent bucket whose best entry loses, and stop within a
+        # bucket at the first losing entry.
+        #
+        # Historically candidates were generated ascending by pos (== count
+        # descending here) and trimmed with a stable sort on variance, and
+        # which candidate survives a tie is visible in the final result.  The
+        # heap key (-sumsq, count, -k) reproduces that order exactly, which
+        # is why the prunes above must use strict comparisons: a tie on
+        # sumsq is settled by the (count, -k) part, not dropped early.
+        nxt: dict[int, list[Entry]] = {}
+        remaining_stages = stage_num - stages_used
+        extra = (emb_time if stages_used == 1 else 0.0) + (
+            head_time if stages_used == stage_num else 0.0
+        )
+        for new_pos in range(stages_used, num_layers - remaining_stages + 1):
+            bucket: list = []
+            full = False
+            for count in range(1, new_pos - stages_used + 2):
+                entries = prev.get(new_pos - count)
+                if entries is None:
+                    continue
+                stage_comp = prefix[new_pos] - prefix[new_pos - count] + extra
                 sq = stage_comp * stage_comp
-                bucket = next_partial.setdefault((pos + count, stages_used), [])
-                for entry in entries:
-                    bucket.append(
-                        (entry[0] + stage_comp, entry[1] + sq, count, stage_comp, entry)
-                    )
-
-        trimmed: dict[tuple[int, int], list[Entry]] = {}
-        keep = max(top_k * 4, top_k)
-        n = float(stages_used)
-        for key, entries in next_partial.items():
-            ranked = sorted(entries, key=lambda e: e[1] / n - (e[0] / n) ** 2)
-            trimmed[key] = ranked[:keep]
-        partial = trimmed
+                if full:
+                    worst_kept = -bucket[0][0]
+                    if sq > worst_kept:
+                        break
+                    if sq + entries[0][0] > worst_kept:
+                        continue
+                for k, entry in enumerate(entries):
+                    total_sq = entry[0] + sq
+                    item = (-total_sq, count, -k, (total_sq, count, stage_comp, entry))
+                    if full:
+                        if item > bucket[0]:
+                            heapq.heapreplace(bucket, item)
+                        else:
+                            break  # entries ascend: the rest only get worse
+                    else:
+                        heapq.heappush(bucket, item)
+                        full = len(bucket) >= keep
+            if bucket:
+                # descending heap items == the legacy stable-sorted order
+                # (sumsq ascending, generation order breaking ties); the next
+                # round relies on entries[0] being each bucket's best
+                nxt[new_pos] = [item[3] for item in sorted(bucket, reverse=True)]
+        prev = nxt
 
     def _materialize(entry: Entry) -> tuple[list[int], list[float]]:
         counts: list[int] = []
         times: list[float] = []
-        while entry is not None and entry[2]:
-            counts.append(entry[2])
-            times.append(entry[3])
-            entry = entry[4]
+        while entry is not None and entry[1]:
+            counts.append(entry[1])
+            times.append(entry[2])
+            entry = entry[3]
         counts.reverse()
         times.reverse()
         return counts, times
 
     finished: list[tuple[float, list[int]]] = []
-    for (pos, stages_used), entries in partial.items():
-        if pos != num_layers or stages_used != stage_num:
-            continue
-        for entry in entries:
-            counts, times = _materialize(entry)
-            finished.append((partition_variance(times), counts))
+    for entry in prev.get(num_layers, []):
+        counts, times = _materialize(entry)
+        finished.append((partition_variance(times), counts))
 
     finished.sort(key=lambda x: x[0])
     unique: list[tuple[float, list[int]]] = []
