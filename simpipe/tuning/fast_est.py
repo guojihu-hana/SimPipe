@@ -29,8 +29,50 @@ def _stage_device_map(placement: list[list[int]], stage_num: int) -> list[int | 
     return owner
 
 
+def _row_load(row: list[int], stage_times: list[float]) -> float:
+    # summation order matches _device_loads exactly (row order)
+    return sum(stage_times[sid] for sid in row)
+
+
 def _device_loads(placement: list[list[int]], stage_times: list[float]) -> list[float]:
     return [sum(stage_times[sid] for sid in row) for row in placement]
+
+
+def _moved_score(
+    rows: list[list[int]],
+    loads: list[float],
+    owner: list[int | None],
+    adj: int,
+    stage_times: list[float],
+    sid: int,
+    from_d: int,
+    to_d: int,
+    to_row: list[int] | None = None,
+) -> tuple[tuple[float, int, float], float, float, list[int]]:
+    """Score of the placement after moving sid from from_d to to_d.
+
+    Only the two affected rows are recomputed (in the same element order the
+    full scorer uses), the untouched loads are reused verbatim, and the
+    adjacent-pair count is updated by an integer delta, so the returned score
+    is bit-identical to placement_proxy_score(_transfer_stage(...)).
+    Returns (score, new_from_load, new_to_load, new_to_row).
+    """
+    new_from = _row_load([s for s in rows[from_d] if s != sid], stage_times)
+    if to_row is None:
+        to_row = sorted(rows[to_d] + [sid])
+    new_to = _row_load(to_row, stage_times)
+    trial = loads[:]
+    trial[from_d] = new_from
+    trial[to_d] = new_to
+    new_adj = adj
+    for nb in (sid - 1, sid + 1):
+        if 0 <= nb < len(owner) and nb != sid:
+            if owner[nb] == from_d:
+                new_adj -= 1
+            if owner[nb] == to_d:
+                new_adj += 1
+    score = (_load_variance(trial), new_adj, max(trial) if trial else 0.0)
+    return score, new_from, new_to, to_row
 
 
 def _load_variance(loads: list[float]) -> float:
@@ -87,6 +129,7 @@ def _generate_adjacent_dispersal_variants(
     *,
     max_stage_per_device: int | None,
     add: Callable[[list[list[int]]], None],
+    scorer: "_SeedScorer | None" = None,
 ) -> None:
     owner = _stage_device_map(base, stage_num)
     for sid in range(stage_num - 1):
@@ -104,6 +147,8 @@ def _generate_adjacent_dispersal_variants(
                 len(row) > max_stage_per_device for row in variant
             ):
                 continue
+            if scorer is not None:
+                scorer.record_move(variant, sid + 1, d0, target)
             add(variant)
 
 
@@ -111,8 +156,10 @@ def _generate_transfer_neighbors(
     seed_placements: list[list[list[int]]],
     device_num: int,
     add: Callable[[list[list[int]]], None],
+    scorers: "list[_SeedScorer] | None" = None,
 ) -> None:
-    for placement in seed_placements:
+    for seed_idx, placement in enumerate(seed_placements):
+        scorer = scorers[seed_idx] if scorers is not None else None
         for from_device, stages in enumerate(placement):
             for stage_id in stages:
                 for target in range(device_num):
@@ -120,7 +167,53 @@ def _generate_transfer_neighbors(
                         continue
                     variant = _transfer_stage(placement, stage_id, from_device, target)
                     if variant is not None:
+                        if scorer is not None:
+                            scorer.record_move(variant, stage_id, from_device, target)
                         add(variant)
+
+
+class _SeedScorer:
+    """Scores one-move neighbors of a fixed seed placement incrementally and
+    collects them into a shared placement-key -> proxy-score table."""
+
+    def __init__(
+        self,
+        seed: list[list[int]],
+        stage_times: list[float],
+        scores: dict[tuple, tuple],
+    ) -> None:
+        self.rows = seed
+        self.stage_times = stage_times
+        self.scores = scores
+        self.loads = _device_loads(seed, stage_times)
+        self.owner = _stage_device_map(seed, len(stage_times))
+        self.adj = _adjacent_same_device_count(seed, len(stage_times))
+        scores.setdefault(
+            _placement_key(seed),
+            (
+                _load_variance(self.loads),
+                self.adj,
+                max(self.loads) if self.loads else 0.0,
+            ),
+        )
+
+    def record_move(
+        self, variant: list[list[int]], sid: int, from_d: int, to_d: int
+    ) -> None:
+        key = _placement_key(variant)
+        if key in self.scores:
+            return
+        score, _new_from, _new_to, _to_row = _moved_score(
+            self.rows,
+            self.loads,
+            self.owner,
+            self.adj,
+            self.stage_times,
+            sid,
+            from_d,
+            to_d,
+        )
+        self.scores[key] = score
 
 
 def _greedy_balance_placement(
@@ -129,28 +222,41 @@ def _greedy_balance_placement(
     stage_times: list[float],
     max_steps: int,
 ) -> list[list[int]]:
-    current = [row[:] for row in base]
-    current_score = placement_proxy_score(current, stage_times)
+    """Hill-climb single-stage moves; each neighbor is scored incrementally
+    (two rows + O(devices)) instead of rebuilding and rescoring the whole
+    placement, with scores bit-identical to the full scorer.  Visit order
+    and the strict < acceptance match the original, so the walk is too."""
+    rows = [row[:] for row in base]
+    stage_cnt = len(stage_times)
+    loads = _device_loads(rows, stage_times)
+    owner = _stage_device_map(rows, stage_cnt)
+    adj = _adjacent_same_device_count(rows, stage_cnt)
+    current_score = (_load_variance(loads), adj, max(loads) if loads else 0.0)
     for _ in range(max_steps):
-        best_variant: list[list[int]] | None = None
         best_score = current_score
-        for from_device, stages in enumerate(current):
-            for stage_id in stages:
-                for target in range(device_num):
-                    if target == from_device:
+        best_move: tuple | None = None
+        for from_d, stages in enumerate(rows):
+            for sid in stages:
+                for to_d in range(device_num):
+                    if to_d == from_d:
                         continue
-                    variant = _transfer_stage(current, stage_id, from_device, target)
-                    if variant is None:
-                        continue
-                    score = placement_proxy_score(variant, stage_times)
+                    score, new_from, new_to, to_row = _moved_score(
+                        rows, loads, owner, adj, stage_times, sid, from_d, to_d
+                    )
                     if score < best_score:
                         best_score = score
-                        best_variant = variant
-        if best_variant is None:
+                        best_move = (from_d, sid, to_d, new_from, new_to, to_row)
+        if best_move is None:
             break
-        current = best_variant
+        from_d, sid, to_d, new_from, new_to, to_row = best_move
+        rows[from_d] = [s for s in rows[from_d] if s != sid]
+        rows[to_d] = to_row
+        loads[from_d] = new_from
+        loads[to_d] = new_to
+        owner[sid] = to_d
+        adj = best_score[1]
         current_score = best_score
-    return current
+    return rows
 
 
 def generate_octopipe_placement_candidates(
@@ -176,12 +282,18 @@ def generate_octopipe_placement_candidates(
     chunk = max(1, stage_num // device_num)
     max_stage_per_device = chunk + 1 if stage_times is None else None
 
+    # single-move variants of a seed are scored incrementally against it;
+    # everything else (seeds, random swaps) falls back to the full scorer
+    scores: dict[tuple, tuple] = {}
+    base_scorer = _SeedScorer(base, stage_times, scores) if stage_times is not None else None
+
     _generate_adjacent_dispersal_variants(
         base,
         device_num,
         stage_num,
         max_stage_per_device=max_stage_per_device,
         add=add,
+        scorer=base_scorer,
     )
 
     if stage_num == device_num:
@@ -197,14 +309,21 @@ def generate_octopipe_placement_candidates(
         )
         add(balanced)
         seed_placements.extend([balanced])
+        balanced_scorer = _SeedScorer(balanced, stage_times, scores)
         _generate_adjacent_dispersal_variants(
             balanced,
             device_num,
             stage_num,
             max_stage_per_device=None,
             add=add,
+            scorer=balanced_scorer,
         )
-        _generate_transfer_neighbors(seed_placements, device_num, add=add)
+        _generate_transfer_neighbors(
+            seed_placements,
+            device_num,
+            add=add,
+            scorers=[base_scorer, balanced_scorer],
+        )
 
     if stage_times is not None:
         for _ in range(max(0, beam_width - len(candidates))):
@@ -216,10 +335,16 @@ def generate_octopipe_placement_candidates(
                 for row in c:
                     row.sort()
                 add(c)
-        ranked = sorted(
-            candidates,
-            key=lambda placement: placement_proxy_score(placement, stage_times),
-        )
+
+        def score_of(placement: list[list[int]]) -> tuple:
+            key = _placement_key(placement)
+            score = scores.get(key)
+            if score is None:
+                score = placement_proxy_score(placement, stage_times)
+                scores[key] = score
+            return score
+
+        ranked = sorted(candidates, key=score_of)
         ordered: list[list[list[int]]] = []
         seen_keys: set[tuple[tuple[int, ...], ...]] = set()
         for placement in [base] + ranked:
