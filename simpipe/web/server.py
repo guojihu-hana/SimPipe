@@ -122,8 +122,10 @@ def run_simulation(yaml_text: str) -> dict:
 def _gantt_data(records: list[dict]) -> dict:
     """Compact block list for client-side canvas rendering.
 
-    One entry per device: blocks = [[start, end, wtype, mid, sid], ...]
-    sorted by start time.  Times are simulator ticks (0.01 ms).
+    One entry per device: blocks = [[start, end, wtype, mid, sid, kind], ...]
+    sorted by start time; kind is "" for backbone blocks, "enc:<name>" /
+    "dec:<name>" for multimodal modules (drawn in their own palettes).
+    Times are simulator ticks (0.01 ms).
     """
     devices: dict[int, list] = {}
     max_t = 0.0
@@ -132,9 +134,13 @@ def _gantt_data(records: list[dict]) -> dict:
         end = float(r.get("end") or start + (r.get("duration") or 1))
         if end < start:
             start, end = end, start
+        kind = ""
+        if r.get("aux"):
+            role = str(r.get("role", ""))
+            kind = ("enc:" if role == "encoder" else "dec:") + str(r["aux"])
         devices.setdefault(int(r["did"]), []).append(
             [round(start, 3), round(end, 3), str(r.get("wtype", "F")).upper(),
-             int(r["mid"]), int(r.get("sid", 0))]
+             int(r["mid"]), int(r.get("sid", 0)), kind]
         )
         max_t = max(max_t, end)
     return {
@@ -147,7 +153,11 @@ def _gantt_data(records: list[dict]) -> dict:
 
 
 def _per_rank_rows(partition, placement, stats, memory) -> list[dict]:
-    """One row per PP rank: partition, placement, comp/bubble, memory."""
+    """One row per PP rank: partition, placement, comp/bubble, memory.
+
+    Devices past the backbone's (dedicated encoder/decoder hosts) get an
+    extra row with no stages, so their aux load and memory stay visible.
+    """
     comp_by_did = {d.did: d for d in stats.per_device}
     mem_by_did = {d["did"]: d for d in (memory or {}).get("per_device", [])}
 
@@ -178,6 +188,29 @@ def _per_rank_rows(partition, placement, stats, memory) -> list[dict]:
                 "peak_gb": _gb(mem, "peak"),
                 "hbm_gb": _gb(mem, "hbm"),
                 "feasible": mem.get("feasible"),
+                "aux": list(mem.get("aux_modules", [])),
+            }
+        )
+    # dedicated aux devices: memory rows exist past the backbone ranks
+    for did in sorted(d for d in mem_by_did if d >= len(placement)):
+        mem = mem_by_did[did]
+        rows.append(
+            {
+                "rank": did,
+                "stages": [],
+                "layers": [],
+                "comp": None,
+                "bubble": None,
+                "bubble_ratio": None,
+                "warmup_bubble": None,
+                "cooldown_bubble": None,
+                "residual_bubble": None,
+                "model_state_gb": _gb(mem, "model_state"),
+                "activation_peak_gb": _gb(mem, "activation_peak"),
+                "peak_gb": _gb(mem, "peak"),
+                "hbm_gb": _gb(mem, "hbm"),
+                "feasible": mem.get("feasible"),
+                "aux": list(mem.get("aux_modules", [])),
             }
         )
     return rows
