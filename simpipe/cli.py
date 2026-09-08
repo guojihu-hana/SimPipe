@@ -9,19 +9,12 @@ from simpipe.config.pipeline_config import write_pipeline_config
 from simpipe.config.sim_config import SimConfig
 from simpipe.core.executor import build_simulation, first_replica_records
 from simpipe.metrics.comp_bubble import analyze_pipeline_comp_bubble
-from simpipe.models.registry import (
-    MOCK_MODEL_NAME,
-    get_preset,
-    get_profile_times,
-    mock_profile_times,
-    profile_data,
-    timing_model_data,
-    uses_mock_times,
-)
+from simpipe.models.registry import (MOCK_MODEL_NAME, get_preset, profile_data,
+                                     profile_times_for_model,
+                                     timing_model_data)
 from simpipe.tuning.bubble_overlap import format_group
 from simpipe.tuning.sweep import run_sweep, sweep_configs
 from simpipe.viz.gantt import format_gantt_detailed_info, write_gantt_svg
-
 
 _MOCK_TIME_KEYS = (
     "layer_time", "layer_f_time", "layer_b_time", "layer_w_time", "pattern",
@@ -63,18 +56,7 @@ def _profile_times_for_config(cfg: SimConfig):
     """ProfileTimes for a config (mock, external YAML, or registry), or None."""
     if not cfg.profiled_data:
         return None
-    if uses_mock_times(cfg.model):
-        pt = mock_profile_times(cfg.model)
-    elif cfg.model.profile_times_path:
-        from simpipe.models.profile_times import profile_times_from_preset
-
-        data = yaml.safe_load(Path(cfg.model.profile_times_path).read_text())
-        pt = profile_times_from_preset(data).slice_layers(cfg.model.num_layers)
-    else:
-        pt = get_profile_times(cfg.model.name).slice_layers(cfg.model.num_layers)
-    if cfg.model.recompute:
-        pt = pt.with_full_recompute()
-    return pt
+    return profile_times_for_model(cfg.model)
 
 
 def _load_run_inputs(config: str | None, model: str, schedule: str | None):
