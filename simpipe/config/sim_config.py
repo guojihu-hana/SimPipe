@@ -8,6 +8,7 @@ import yaml
 from simpipe.config.batch import BatchConfig
 from simpipe.config.hardware import HardwareConfig
 from simpipe.config.model import ModelConfig
+from simpipe.config.multimodal import AuxModuleConfig, aux_modules_from_config
 from simpipe.config.parallel import ParallelConfig
 from simpipe.config.tuning import TuningConfig
 
@@ -28,6 +29,10 @@ class SimConfig:
     tuning: TuningConfig = field(default_factory=TuningConfig)
     # Variable-length microbatch spec; when set it defines micro_batch_num.
     batch: BatchConfig | None = None
+    # Multimodal front/back modules (vision/audio encoders, decoders, ...);
+    # each microbatch flows encoders -> backbone -> decoders with P2P comms.
+    encoders: list[AuxModuleConfig] = field(default_factory=list)
+    decoders: list[AuxModuleConfig] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> SimConfig:
@@ -59,6 +64,8 @@ class SimConfig:
             placement=data.get("placement"),
             tuning=TuningConfig.from_dict(tuning_data),
             batch=batch,
+            encoders=aux_modules_from_config(data.get("encoders"), role="encoder"),
+            decoders=aux_modules_from_config(data.get("decoders"), role="decoder"),
         )
 
 

@@ -40,6 +40,9 @@ class WorkloadPlan:
     # Tuned execution order: slot mid k runs input microbatch mid_order[k]
     # (mid_scales is already permuted accordingly).  None = input order.
     mid_order: list[int] | None = None
+    # Multimodal encoder/decoder instances (simpipe.pipeline.aux_modules);
+    # None when the config declares no encoders/decoders.
+    aux_plan: object | None = None
 
     @property
     def stage_num(self) -> int:
