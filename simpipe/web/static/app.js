@@ -2347,9 +2347,62 @@ function showError(message, tb) {
   };
 }
 let runInflight = false, runQueued = false;
+
+/* Session-wide run history.  The array is chronological with the current
+   run last; the dropdown pins the current run on top (not clickable) and
+   lists the older runs below it in time order.  Restoring an entry moves
+   it back to the current slot instead of appending a duplicate. */
+const runHistory = []; // { ms, yaml, at }
+let pendingRestore = null; // entry the in-flight run is restoring, if any
+function renderHistory() {
+  $("hist-wrap").hidden = runHistory.length === 0;
+  const pop = $("hist-pop");
+  pop.textContent = "";
+  if (!runHistory.length) return;
+  const order = [runHistory.length - 1, ...runHistory.slice(0, -1).keys()];
+  for (const i of order) {
+    const h = runHistory[i];
+    const isCur = i === runHistory.length - 1;
+    const row = document.createElement("div");
+    row.className = "hist-row" + (isCur ? " current" : "");
+    const idx = document.createElement("span");
+    idx.className = "hist-idx";
+    idx.textContent = `#${i + 1}`;
+    const ms = document.createElement("b");
+    ms.textContent = `${h.ms.toFixed(2)} ms`;
+    const at = document.createElement("span");
+    at.className = "hist-at";
+    at.textContent = h.at.toTimeString().slice(0, 8);
+    row.append(idx, ms, at);
+    if (!isCur) {
+      row.title = "Restore this run's config";
+      row.addEventListener("click", () => {
+        pop.hidden = true;
+        if (!confirm(`Restore the config of run #${i + 1} (${h.ms.toFixed(2)} ms)?`)) return;
+        pendingRestore = h;
+        setConfigText(h.yaml);
+        clearTimeout(autoRunTimer); // one deliberate run, not the debounced one
+        run();
+      });
+    }
+    pop.appendChild(row);
+  }
+}
+$("hist-btn").addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  const pop = $("hist-pop");
+  pop.hidden = !pop.hidden;
+  if (!pop.hidden) pop.scrollTop = 0; // current sits on top
+});
+document.addEventListener("click", (ev) => {
+  if (!$("hist-wrap").contains(ev.target)) $("hist-pop").hidden = true;
+});
+
 async function run() {
   if (runInflight) { runQueued = true; return; }
   runInflight = true;
+  const restoring = pendingRestore; // consumed by this run only
+  pendingRestore = null;
   const btn = $("run-btn");
   btn.disabled = true; btn.textContent = "Running...";
   $("toast").style.display = "none";
@@ -2363,10 +2416,11 @@ async function run() {
   const timerTick = setInterval(() => { timerEl.textContent = elapsed(); }, 100);
   try {
     await flushDump(); // form edits land in the YAML before running
+    const cfgSnapshot = $("config").value; // what History restores later
     const resp = await fetch("/api/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ config: $("config").value }),
+      body: JSON.stringify({ config: cfgSnapshot }),
     });
     const r = await resp.json();
     if (!r.ok) { showError(r.error || "run failed", r.traceback); return; }
@@ -2379,7 +2433,22 @@ async function run() {
     $("config-out").textContent = r.pipeline_config;
     $("dl-svg").disabled = false;
     $("dl-config").disabled = false;
-    $("gen-time").textContent = "generated in " + elapsed();
+    // wall-clock generation time + this run's simulated pipeline time; the
+    // History dropdown holds every previous run for comparison / restore
+    const exeMs = r.makespan / 100;
+    $("gen-time").textContent =
+      `Generated in ${elapsed()} \u00b7 Exe time: ${exeMs.toFixed(2)} ms`;
+    if (restoring && cfgSnapshot === restoring.yaml) {
+      // a restore re-promotes the old entry to the current slot, no duplicate
+      const k = runHistory.indexOf(restoring);
+      if (k >= 0) runHistory.splice(k, 1);
+      restoring.ms = exeMs;
+      restoring.at = new Date();
+      runHistory.push(restoring);
+    } else {
+      runHistory.push({ ms: exeMs, yaml: cfgSnapshot, at: new Date() });
+    }
+    renderHistory();
   } catch (e) {
     showError("Request failed: " + e);
   } finally {
