@@ -1,0 +1,77 @@
+# Multimodal pipeline: encoders -> backbone -> decoder.
+#
+# Every microbatch first runs all its encoders (independent of each other),
+# then flows through the backbone stages, then the decoder; backward retraces
+# the same path in reverse.  Encoder/decoder <-> backbone hops are P2P
+# transfers (hardware.p2p_latency_ms) whenever they cross devices.
+#
+# placement options per module:
+#   first_stage / last_stage  share the boundary stage's device (the octopipe
+#                             partition search then rebalances layers around
+#                             the extra load)
+#   replicated                one weight copy per backbone device; micro-
+#                             batches are sharded round-robin, so each runs
+#                             its encoder exactly once and up to pp_size run
+#                             in parallel (module DP; weights paid per device)
+#   dedicated                 its own extra device after the backbone's,
+#                             linked via P2P
+#   [0, 2]                    explicit device list: same round-robin microbatch
+#                             sharding as replicated, on the listed devices
+schedule: 1f1b
+profiled_data: true
+time_limit: 20000000
+
+model:
+  name: mock_model
+  num_layers: 32
+  pattern: ET*32L
+  forward_ms:
+    T: 1.0
+
+parallel:
+  pp_size: 8
+  micro_batch_num: 16
+
+hardware:
+  p2p_latency_ms: 0.4
+
+# act_gb is one microbatch's activation footprint, resident from the module's
+# F until its B completes.  The memory estimate charges it by the schedule's
+# peak in-flight count.  For backfilling copies (dedicated devices, off-anchor
+# shards, OctoPipe) tuning.aux_memory_opt (default on) throttles encoder Fs to
+# the smallest in-flight cap that keeps the makespan unchanged, so they don't
+# stockpile activations early.  Copies spliced into a static schedule (same
+# device as their boundary stage) already run each F at the latest useful
+# moment and are exempt.
+# An aux module IS a model: the model section is a full backbone-style model
+# config (mock_model with inline times, or any profiled model by name, e.g.
+# "model: {name: jamba-20B}" -- pattern/layers/times then come from profiles/).
+encoders:
+  - name: vit            # vision encoder next to stage 0, spelled as a
+    model:               # backbone-style mock model: per-layer-type times,
+      name: mock_model   # summed over the pattern (4 x 0.5 = 2 ms F etc.)
+      num_layers: 4
+      pattern: T*4
+      forward_ms:
+        T: 0.5
+      backward_ms:
+        T: 1.0
+    placement: first_stage
+    params_gb: 2.0
+    act_gb: 0.3
+  - name: audio          # audio encoder on its own device (P2P to stage 0);
+    forward_ms: 1.5      # flat scalars = module totals, shorthand for a
+    placement: dedicated # single-layer mock model
+    params_gb: 1.0
+    act_gb: 0.2
+    recompute: true      # full recompute: B re-runs F first (B = F+B, W
+                         # unchanged); maps onto model.recompute, same fold
+                         # as the backbone's; size act_gb for checkpoints only
+
+decoders:
+  - name: dit            # diffusion decoder behind the last stage
+    forward_ms: 2.0
+    backward_ms: 4.0
+    placement: last_stage
+    params_gb: 3.0
+    act_gb: 0.3

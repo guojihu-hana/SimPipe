@@ -207,6 +207,46 @@ partition_layers: [7, 7, 7, 7, 7, 7, 7, 7]
 placement: [[0, 4], [1, 5], [2, 6], [3, 7]]
 ```
 
+### Multimodal Encoders And Decoders
+
+Multimodal front/back modules (vision/audio/text encoders, diffusion decoders, ...) can be attached around the backbone pipeline. Per microbatch, all encoders must finish before backbone stage 0 starts, and the last stage's backward waits for the decoders (the loss sits behind them); encoder backward runs after stage 0's backward. Hops that cross devices pay `hardware.p2p_latency_ms`. Modules of the same kind are independent of each other by default. See `examples/multimodal.yaml`.
+
+On static schedules (everything except OctoPipe), copies that sit on the same device as their boundary stage are spliced into that device's schedule so each microbatch runs `enc F -> bb F -> ... -> dec F -> dec B -> ... -> bb B -> enc B` in strict order: encoder forwards do not run early during warmup, and encoder backwards are not deferred by later backbone forwards. Copies elsewhere (dedicated devices, off-anchor shards of replicated/explicit placements) and all copies under OctoPipe backfill idle slots instead, and only when the work fits before the next backbone entry could start.
+
+An aux module *is* a model: its `model` section is a full backbone-style model config whose timings flow through the same loading pipeline — a `mock_model` with inline per-layer-type times, or any profiled model by name (pattern, layers and times then come from `profiles/`). The module runs as one atomic workload per pass whose F/B/W are the sums over its layers (embedding/head included), and `model.recompute` folds the forward re-run into B exactly like the backbone.
+
+```yaml
+encoders:
+  - name: vit              # module label; model.name says what it runs
+    model:                 # a model config, like the backbone's:
+      name: mock_model     # mock_model with inline per-layer-type times (ms),
+      num_layers: 4        # or a profiled name (e.g. jamba-20B) whose
+      pattern: T*4         # pattern/layers/times load from profiles/
+      forward_ms: {T: 0.5} # backward defaults to forward, weight to backward
+      backward_ms: {T: 1.0}
+      recompute: false     # true: B re-runs F first (B costs F+B); set
+    placement: first_stage # act_gb to the checkpointed footprint yourself
+    params_gb: 2.0         # parameter tensor size for the memory estimate
+    act_gb: 0.3            # one microbatch's activation, F start -> B end
+  - name: audio
+    forward_ms: 1.5        # flat scalars (module totals per microbatch in ms)
+    placement: dedicated   # are shorthand for a single-layer mock model
+
+decoders:
+  - name: dit
+    forward_ms: 2.0
+    placement: last_stage
+```
+
+`placement` options:
+
+- `first_stage` / `last_stage` — runs on the device holding the boundary stage. The OctoPipe/BAPAR partition search folds the module's cost into that stage's embedding/head time, so layers rebalance around it.
+- `replicated` — one weight copy per backbone device with microbatches sharded round-robin: each microbatch runs its encoder exactly once, on one rank, and up to `pp_size` run in parallel (data parallelism over the module). Weights are paid on every device, compute is split.
+- `dedicated` — its own extra device appended after the backbone's, connected via P2P; it shows up as an extra row in the Gantt chart and memory summary.
+- `[0, 2]` — explicit device-id list: same round-robin microbatch sharding as `replicated`, restricted to the listed devices.
+
+Encoder activations (`act_gb` per microbatch) live from the module's F until its B completes, which follows the backbone's backward — so an encoder that runs all its forwards upfront holds every microbatch's activation at once. The in-flight throttle only concerns backfilling copies (dedicated devices, off-anchor shards, OctoPipe): `tuning.aux_memory_opt` (default on) searches the smallest per-copy in-flight cap that keeps the makespan unchanged and throttles encoder forwards to it, cutting the activation peak at zero bubble cost (e.g. 16 -> 9 resident microbatches in the example above). `tuning.aux_inflight_limit` overrides the cap explicitly; too-small caps deadlock the static order and the run reports `stalled`. Spliced copies are exempt and skip the search entirely: their forwards already run at the latest useful moment, so their peak is fixed by the schedule shape (1F1B holds about one activation per stage; AFAB legitimately holds all of them through the AF phase). Decoders need no throttle: their F -> B window is naturally short. The memory summary charges `act_gb x peak` to each copy's device.
+
 ### Memory Estimation
 
 Memory is estimated after simulation in `simpipe/memory/estimate.py` and stored in `result.memory` plus `pipeline_config.yaml`.
