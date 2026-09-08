@@ -30,6 +30,18 @@ class TuningConfig:
     # microbatch list reported as plan.mid_order / pipeline_config.
     batch_order_tune: bool | None = None
     batch_order_max_sims: int = 64
+    # Throttle encoder activations at zero bubble cost: search the smallest
+    # per-copy in-flight cap (F started, B not finished) that keeps the
+    # makespan of the untuned schedule, so encoders stop stockpiling
+    # activations long before the backbone consumes them.  Only backfilling
+    # copies (dedicated devices, off-anchor shards, OctoPipe) are shaped by
+    # this; copies spliced into a static schedule already run at the latest
+    # useful moment and are exempt, so all-spliced plans skip the search.
+    aux_memory_opt: bool = True
+    # Explicit cap override; skips the search.  0/None = search (when
+    # aux_memory_opt) or unlimited.  Too-small caps can deadlock the static
+    # order; the run then reports stalled instead of completing.
+    aux_inflight_limit: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict | None) -> TuningConfig:
@@ -58,4 +70,10 @@ class TuningConfig:
                 None if batch_order_tune is None else bool(batch_order_tune)
             ),
             batch_order_max_sims=int(data.get("batch_order_max_sims", 64)),
+            aux_memory_opt=bool(data.get("aux_memory_opt", True)),
+            aux_inflight_limit=(
+                None
+                if data.get("aux_inflight_limit") is None
+                else int(data["aux_inflight_limit"])
+            ),
         )

@@ -6,15 +6,14 @@ from simpipe.config.sim_config import SimConfig
 from simpipe.core.runtime import PipelineRuntime
 from simpipe.core.types import Schedule
 from simpipe.graph.model_graph import ModelGraph
-from simpipe.memory.estimate import PipelineMemoryEstimate, estimate_pipeline_memory
+from simpipe.memory.estimate import (PipelineMemoryEstimate,
+                                     estimate_pipeline_memory)
 from simpipe.pipeline.partition import layer_partition_to_stage_specs
-from simpipe.pipeline.schedule_config import (
-    apply_schedule_config,
-    resolve_partition_layers,
-    resolve_placement,
-    resolve_schedule,
-    split_layer_times_for_zbh,
-)
+from simpipe.pipeline.schedule_config import (apply_schedule_config,
+                                              resolve_partition_layers,
+                                              resolve_placement,
+                                              resolve_schedule,
+                                              split_layer_times_for_zbh)
 from simpipe.pipeline.types import WorkloadPlan
 from simpipe.pipeline.workload_gen import build_workload_plan
 
@@ -77,7 +76,9 @@ class Executor:
         limit = time_limit or self.config.time_limit
         max_time = 0
         all_records: list[dict] = []
-        idle = [0.0] * self.plan.device_num
+        aux_plan = getattr(self.plan, "aux_plan", None)
+        extra_devices = aux_plan.extra_device_num if aux_plan else 0
+        idle = [0.0] * (self.plan.device_num + extra_devices)
         for pipeline in self.pipelines:
             if self.discrete_event_time:
                 t = pipeline.run_discrete(limit)
@@ -162,6 +163,34 @@ def build_simulation(
             head_w_time=head_w_time,
         )
 
+    # Aux modules pinned to the first/last-stage device compete with that
+    # boundary stage for compute, so the partition search must account for
+    # them; fold their per-microbatch cost into the embedding/head knobs the
+    # search already understands.  Tune-only: build_workload_plan below keeps
+    # the original values, aux compute stays a separate simulated workload.
+    # Replicated/dedicated/explicit placements don't skew any single stage
+    # (uniform or off-pipeline load), so nothing is folded for them.
+    tune_emb = [embedding_f_time, embedding_b_time, embedding_w_time]
+    tune_head = [head_f_time, head_b_time, head_w_time]
+    if (config.encoders or config.decoders) and layer_f_times:
+        from simpipe.config.multimodal import FIRST_STAGE, LAST_STAGE
+
+        aux_all = list(config.encoders) + list(config.decoders)
+        bwd_split = config.parallel.bwd_split
+        for target, place in ((tune_emb, FIRST_STAGE), (tune_head, LAST_STAGE)):
+            mods = [m for m in aux_all if m.placement == place]
+            if not mods:
+                continue
+            f_x = sum(m.f_ticks for m in mods)
+            b_x = sum(m.b_ticks for m in mods)
+            w_x = sum(m.w_ticks for m in mods)
+            if not bwd_split:
+                b_x += w_x
+                w_x = 0.0
+            target[0] = (target[0] or 0.0) + f_x
+            target[1] = (target[1] or 0.0) + b_x
+            target[2] = (target[2] or 0.0) + w_x
+
     tune_top_results: list = []
     if (
         sched == Schedule.OctoPipe
@@ -182,12 +211,12 @@ def build_simulation(
             tune_b,
             layer_w_times,
             config.tuning,
-            embedding_f_time=embedding_f_time,
-            embedding_b_time=embedding_b_time,
-            embedding_w_time=embedding_w_time,
-            head_f_time=head_f_time,
-            head_b_time=head_b_time,
-            head_w_time=head_w_time,
+            embedding_f_time=tune_emb[0],
+            embedding_b_time=tune_emb[1],
+            embedding_w_time=tune_emb[2],
+            head_f_time=tune_head[0],
+            head_b_time=tune_head[1],
+            head_w_time=tune_head[2],
         )
         partition_layers = tuned.partition_layers
         placement = tuned.placement
@@ -202,12 +231,12 @@ def build_simulation(
             layer_f_times=layer_f_times,
             layer_b_times=layer_b_times,
             layer_w_times=layer_w_times,
-            embedding_f_time=embedding_f_time,
-            embedding_b_time=embedding_b_time,
-            embedding_w_time=embedding_w_time,
-            head_f_time=head_f_time,
-            head_b_time=head_b_time,
-            head_w_time=head_w_time,
+            embedding_f_time=tune_emb[0],
+            embedding_b_time=tune_emb[1],
+            embedding_w_time=tune_emb[2],
+            head_f_time=tune_head[0],
+            head_b_time=tune_head[1],
+            head_w_time=tune_head[2],
         )
         tune_top_results = []
 
@@ -232,6 +261,16 @@ def build_simulation(
         layer_symbols=layer_symbols,
     )
     plan.layers_per_stage = list(partition_layers)
+    if config.encoders or config.decoders:
+        from simpipe.pipeline.aux_modules import build_aux_plan
+
+        plan.aux_plan = build_aux_plan(
+            config.encoders,
+            config.decoders,
+            pl.device_stages,
+            partition.num_stages,
+            pp.micro_batch_num,
+        )
     batch_order_result = None
     if config.batch is not None:
         plan.mid_scales = config.batch.scales(
@@ -264,6 +303,17 @@ def build_simulation(
             if not batch_order_result.is_identity:
                 plan.mid_scales = [scales[i] for i in batch_order_result.order]
                 plan.mid_order = list(batch_order_result.order)
+    if plan.aux_plan is not None and _has_backfilling_encoder(plan):
+        if config.tuning.aux_inflight_limit:
+            plan.aux_plan.encoder_inflight_limit = config.tuning.aux_inflight_limit
+        elif config.tuning.aux_memory_opt:
+            _tune_aux_inflight(
+                config,
+                graph,
+                plan,
+                overlap_exempt_workloads,
+                overlap_exempt_group_by,
+            )
     executor = Executor(
         config,
         graph,
@@ -275,3 +325,64 @@ def build_simulation(
     executor.tune_top_results = tune_top_results
     executor.batch_order_result = batch_order_result
     return executor
+
+
+def _has_backfilling_encoder(plan: WorkloadPlan) -> bool:
+    """True when some encoder copy schedules by backfilling (so the in-flight
+    throttle can shape it).  On static schedules, copies anchored to stage 0's
+    device are spliced into the entry list and run at the latest useful
+    moment already -- throttling them is a no-op or a deadlock (AFAB), so a
+    plan whose encoders are all spliced skips the cap search entirely."""
+    encoders = [i for i in plan.aux_plan.instances if i.role == "encoder"]
+    if not encoders:
+        return False
+    if plan.schedule == Schedule.OctoPipe or not plan.static_schedule:
+        return True
+    stage0_did = next(
+        did for did, sids in enumerate(plan.placement.device_stages) if 0 in sids
+    )
+    return any(inst.device_id != stage0_did for inst in encoders)
+
+
+def _tune_aux_inflight(
+    config: SimConfig,
+    graph: ModelGraph,
+    plan: WorkloadPlan,
+    overlap_exempt_workloads: set[tuple] | None,
+    overlap_exempt_group_by: str,
+) -> None:
+    """Smallest encoder in-flight cap that keeps the uncapped makespan.
+
+    Without a cap, encoders run as early as idle slots allow and stockpile
+    activations the backbone only consumes much later (a dedicated encoder
+    finishes all its microbatches upfront: peak = micro_batch_num).  Capping
+    the alive microbatches (F started, B unfinished) delays encoder Fs into
+    later idle slots, cutting the activation peak; the search keeps only
+    caps whose makespan matches the uncapped baseline, so the bubble stays
+    unchanged.  Doubling search from pp_size+1 (the warmup burst wants about
+    one activation per pipeline stage) costs ~log2 extra simulations; the cap
+    at micro_batch_num is a no-op, so it always terminates.
+    """
+
+    def sim() -> float:
+        result = Executor(
+            config,
+            graph,
+            plan,
+            overlap_exempt_workloads=overlap_exempt_workloads,
+            overlap_exempt_group_by=overlap_exempt_group_by,
+        ).run()
+        return float("inf") if result.stalled else result.makespan
+
+    plan.aux_plan.encoder_inflight_limit = None
+    base = sim()
+    nmb = config.parallel.micro_batch_num
+    k = min(nmb, config.parallel.pp_size + 1)
+    while True:
+        plan.aux_plan.encoder_inflight_limit = k
+        if sim() <= base:
+            return
+        if k >= nmb:  # defensive; a cap of nmb can never block anything
+            plan.aux_plan.encoder_inflight_limit = None
+            return
+        k = min(nmb, k * 2)
