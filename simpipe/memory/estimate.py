@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from dataclasses import replace
 import json
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from simpipe.config.hardware import HardwareConfig
 from simpipe.config.model import ModelConfig
 from simpipe.config.parallel import ParallelConfig
-from simpipe.graph.operator import OpType, Operator
-from simpipe.graph.model_graph import EMBEDDING_LAYER_IDX, ModelGraph, head_layer_idx
+from simpipe.graph.model_graph import (EMBEDDING_LAYER_IDX, ModelGraph,
+                                       head_layer_idx)
+from simpipe.graph.operator import Operator, OpType
 from simpipe.graph.tensor import TensorKind, tensor_bytes
 from simpipe.memory.zero import ZeroMemoryShard, zero_model_state_bytes
-from simpipe.models.pattern import ATTN, MAMBA, MLP, MOE, TRANSFORMER, stack_layer_symbols
+from simpipe.models.pattern import (ATTN, MAMBA, MLP, MOE, TRANSFORMER,
+                                    stack_layer_symbols)
 from simpipe.pipeline.types import WorkloadPlan
-
 
 _FLASH_ATTENTION_SAVED_ACTIVATION_SCALE = 0.5
 
@@ -74,6 +74,9 @@ class DeviceMemoryEstimate:
     p2p_buffer_bytes: int
     hbm_bytes: int
     stages: tuple[StageMemoryEstimate, ...] = field(default_factory=tuple)
+    # multimodal copies living on this device, as "enc:<name>" / "dec:<name>"
+    # (same tags as the Gantt payload); empty for pure-backbone devices
+    aux_modules: tuple[str, ...] = ()
 
     @property
     def model_state_bytes(self) -> int:
@@ -117,6 +120,7 @@ class DeviceMemoryEstimate:
             "p2p_buffer_gb": _gb(self.p2p_buffer_bytes),
             "peak_gb": _gb(self.peak_bytes),
             "hbm_gb": _gb(self.hbm_bytes),
+            **({"aux_modules": list(self.aux_modules)} if self.aux_modules else {}),
         }
 
 
@@ -178,6 +182,10 @@ def estimate_pipeline_memory(
             )
         )
 
+    aux_plan = getattr(plan, "aux_plan", None)
+    if aux_plan is not None:
+        devices = _apply_aux_memory(devices, aux_plan, hbm_bytes, records)
+
     return PipelineMemoryEstimate(
         per_device=tuple(devices),
         zero_stage=parallel.zero_stage,
@@ -185,6 +193,124 @@ def estimate_pipeline_memory(
             spec.embedding.total + spec.head.total + sum(layer.total for layer in spec.layers)
         ),
     )
+
+
+def aux_inflight_peaks(records: list[dict] | None) -> dict[int, int]:
+    """Peak resident microbatches per aux instance (keyed by aux stage id).
+
+    A microbatch's aux activation lives from its F start until its B end;
+    the peak is the max number of simultaneously alive intervals under the
+    simulated schedule (sweep over sorted interval endpoints).
+    """
+    if not records:
+        return {}
+    intervals: dict[int, dict[int, list]] = {}
+    for r in records:
+        if "aux" not in r:
+            continue
+        sid, mid = int(r["sid"]), int(r["mid"])
+        wt = r.get("wtype")
+        if wt not in ("F", "B"):
+            continue
+        span = intervals.setdefault(sid, {}).setdefault(mid, [None, None])
+        if wt == "F":
+            span[0] = float(r.get("start") or 0.0)
+        else:
+            span[1] = float(r.get("end") or 0.0)
+    peaks: dict[int, int] = {}
+    for sid, by_mid in intervals.items():
+        events = []
+        for start, end in by_mid.values():
+            if start is None:
+                continue
+            events.append((start, 1))
+            events.append((end if end is not None else float("inf"), -1))
+        events.sort(key=lambda e: (e[0], e[1]))  # frees before allocs at ties
+        cur = peak = 0
+        for _, delta in events:
+            cur += delta
+            peak = max(peak, cur)
+        peaks[sid] = peak
+    return peaks
+
+
+def _apply_aux_memory(
+    devices: list[DeviceMemoryEstimate],
+    aux_plan,
+    hbm_bytes: int,
+    records: list[dict] | None = None,
+) -> list[DeviceMemoryEstimate]:
+    """Fold encoder/decoder memory into the per-device estimates.
+
+    Each aux copy contributes its params_gb as a bf16 parameter tensor plus
+    the standard Adam state (grad 1x, fp32 master 2x, fp32 moments 4x of the
+    parameter bytes, matching the backbone's mixed-precision layout), and
+    act_gb per resident microbatch at the schedule's peak (aux_inflight_peaks
+    over the run records).  Replicated copies pay this on every device;
+    dedicated copies add a fresh device row after the backbone's.
+    """
+    from dataclasses import replace as _replace
+
+    act_peaks = aux_inflight_peaks(records)
+    extra: dict[int, dict[str, int]] = {}
+    labels: dict[int, list[str]] = {}
+    for inst in aux_plan.instances:
+        agg = extra.setdefault(
+            inst.device_id,
+            {"parameter": 0, "gradient": 0, "master": 0, "moments": 0, "activation": 0},
+        )
+        tag = "enc:" if inst.role == "encoder" else "dec:"
+        labels.setdefault(inst.device_id, []).append(tag + inst.name)
+        if inst.params_gb > 0:
+            params = int(inst.params_gb * 1024**3)
+            agg["parameter"] += params
+            agg["gradient"] += params
+            agg["master"] += 2 * params
+            agg["moments"] += 4 * params
+        if inst.act_gb > 0:
+            peak = act_peaks.get(inst.aux_sid, 0)
+            agg["activation"] += int(inst.act_gb * peak * 1024**3)
+
+    out = list(devices)
+    for did, agg in sorted(extra.items()):
+        if did < len(out):
+            dev = out[did]
+            out[did] = _replace(
+                dev,
+                parameter_bytes=dev.parameter_bytes + agg["parameter"],
+                gradient_bytes=dev.gradient_bytes + agg["gradient"],
+                master_parameter_bytes=dev.master_parameter_bytes + agg["master"],
+                optimizer_moment_bytes=dev.optimizer_moment_bytes + agg["moments"],
+                optimizer_bytes=dev.optimizer_bytes + agg["master"] + agg["moments"],
+                activation_peak_bytes=dev.activation_peak_bytes + agg["activation"],
+                aux_modules=tuple(labels.get(did, ())),
+            )
+    # dedicated aux devices (ids past the backbone's) get their own rows so
+    # the summary shows their memory footprint too
+    backbone_num = len(devices)
+    for extra_idx in range(aux_plan.extra_device_num):
+        did = backbone_num + extra_idx
+        agg = extra.get(
+            did,
+            {"parameter": 0, "gradient": 0, "master": 0, "moments": 0, "activation": 0},
+        )
+        out.append(
+            DeviceMemoryEstimate(
+                did=did,
+                stage_ids=(),
+                parameter_bytes=agg["parameter"],
+                gradient_bytes=agg["gradient"],
+                master_parameter_bytes=agg["master"],
+                optimizer_moment_bytes=agg["moments"],
+                optimizer_bytes=agg["master"] + agg["moments"],
+                activation_peak_bytes=agg["activation"],
+                p2p_buffer_bytes=0,
+                hbm_bytes=hbm_bytes,
+                stages=(),
+                aux_modules=tuple(labels.get(did, ())),
+            )
+        )
+    return out
 
 
 def model_parameter_spec(model: ModelConfig, graph: ModelGraph | None = None) -> ModelParameterSpec:

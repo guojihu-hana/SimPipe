@@ -206,8 +206,8 @@ const CFG_SCHEMA = [
       desc: "Profiled model (has profiles/<name>.json) or mock_model for synthetic timings. Custom names (used with profile_times_path) can be set in the YAML view." },
     { path: "model.num_layers", type: "int", def: 32, min: 1, max: 4096,
       desc: "Transformer body layer count (embedding/head excluded)." },
-    { path: "model.pattern", type: "text", wide: true, ph: "ET*32L",
-      desc: "Layer pattern: E embedding, L head, body types M mamba / * attn / - MLP / T transformer / # MoE; X*N repeats X N times. Editable for mock_model (num_layers follows the pattern; raising num_layers pads T). Profiled models show their pattern read-only." },
+    { path: "model.pattern", type: "text", ph: "ET*32L",
+      desc: "Layer pattern: E embedding, L head, body types M mamba / * attn / - MLP / T transformer / # MoE; X*N repeats X N times. Editable for mock_model (num_layers follows the pattern; raising num_layers pads T). Profiled models show their pattern read-only. Hover to see the full pattern." },
     { path: "model.layer_time", type: "float", min: 0.01, max: 1e9, ph: "e.g. 100 (= 1 ms)", mockOnly: true,
       desc: "Mock timing: uniform per-layer duration in 0.01 ms ticks, F = B = W. Embedding/head cost 0." },
     { path: "model.layer_f_time", type: "float", min: 0.01, max: 1e9, mockOnly: true,
@@ -464,9 +464,25 @@ function buildForm() {
     }
     box.appendChild(fgrid);
     if (sec.sec === "Model") {
+      // + Encoder / + Decoder live in the grid cell next to the (shortened)
+      // pattern box; the pattern's full text shows on hover
+      const addRow = document.createElement("div");
+      addRow.className = "frow aux-add-row";
+      addRow.innerHTML =
+        `<label>Multimodal</label><span class="aux-add-btns">` +
+        `<button type="button" class="small" id="add-encoder" title="Add a multimodal encoder: every microbatch runs all encoders before backbone stage 0.">+ Encoder</button>` +
+        `<button type="button" class="small" id="add-decoder" title="Add a decoder behind the last stage: its F follows the last stage's F and its B gates the last stage's B.">+ Decoder</button></span>`;
+      const patRow = fgrid.querySelector('[data-path="model.pattern"]').closest(".frow");
+      patRow.after(addRow);
+      addRow.querySelector("#add-encoder").addEventListener("click", () => addAuxModule("encoders"));
+      addRow.querySelector("#add-decoder").addEventListener("click", () => addAuxModule("decoders"));
+
       const mt = document.createElement("div");
       mt.id = "model-times"; // per-layer-type f/b/w table, filled dynamically
       box.appendChild(mt);
+      const aux = document.createElement("div");
+      aux.id = "aux-modules"; // encoder/decoder cards, filled dynamically
+      box.appendChild(aux);
     }
     if (sec.id === "batch") {
       const warn = document.createElement("div");
@@ -571,6 +587,417 @@ function refreshFormValues() {
   syncTuningLock();
   renderPartPlace();
   renderModelTimes();
+  renderAuxModules();
+}
+
+/* ============ multimodal encoders / decoders ============
+   cfgObj.encoders / cfgObj.decoders are lists of module mappings (name,
+   model {pattern, per-type times}, placement).  Memory knobs (params_gb,
+   act_gb) are YAML-only and keep whatever the config carries.  Each
+   renders as a nested mini model card (like the backbone's) inside the Model
+   section; edits write the arrays directly and re-dump the YAML.  Legacy
+   flat forward_ms/backward_ms/weight_ms scalars are folded into an
+   equivalent single-layer model on first render.  Number/name inputs update
+   in place (keeping focus); add/remove, placement-shape and pattern changes
+   rebuild the cards. */
+const AUX_PLACEMENTS = ["first_stage", "last_stage", "replicated", "dedicated"];
+const AUX_PLACE_DESC = {
+  first_stage: "Runs on the device holding backbone stage 0 (partition tuning rebalances layers around it).",
+  last_stage: "Runs on the device holding the last backbone stage (partition tuning rebalances layers around it).",
+  replicated: "One weight copy per backbone device; microbatches are sharded round-robin, so each runs its encoder once and up to pp_size run in parallel (module DP).",
+  dedicated: "Gets its own extra device after the backbone's, connected via P2P.",
+  devices: "Explicit device-id list; microbatches are sharded round-robin across the copies (module DP).",
+};
+const AUX_FIELD_DESC = {
+  name: "Display name of this module (Gantt rows and records).",
+  model: "The model this module runs. mock_model: synthetic per-layer-type times below; profiled models take pattern, layers and times from their profile.",
+  num_layers: "Number of body layers; editing pads the pattern with T / truncates it.",
+  pattern: "Layer pattern like the backbone's: body types M mamba / * attn / - MLP / T transformer / # MoE; X*N repeats X N times. The module runs as one block whose F/B/W are the sums over these layers.",
+  recompute: "Full activation recompute: this module's backward re-runs its forward first (B costs F+B, like the backbone's recompute).",
+};
+
+function auxList(role) {
+  return Array.isArray(cfgObj[role]) ? cfgObj[role] : [];
+}
+
+function addAuxModule(role) {
+  const list = auxList(role).slice();
+  const isEnc = role === "encoders";
+  list.push({
+    name: `${isEnc ? "encoder" : "decoder"}${list.length + 1}`,
+    model: { name: "mock_model", num_layers: 4, pattern: "T*4", forward_ms: { T: 0.5 } },
+    placement: isEnc ? "first_stage" : "last_stage",
+  });
+  cfgObj[role] = list;
+  renderAuxModules();
+  scheduleDump();
+  scheduleAutoRun();
+}
+
+/* An aux module is a model.  Old flat specs (total forward_ms/backward_ms/
+   weight_ms scalars) are folded into an equivalent single-layer mock model,
+   and a legacy top-level recompute flag moves onto model.recompute; the
+   engine performs the same normalization when parsing YAML. */
+function auxNormalizeModel(mod) {
+  let m = mod.model;
+  if (!m || (!m.pattern && !m.name)) {
+    const f = typeof mod.forward_ms === "number" ? mod.forward_ms : 1.0;
+    m = { name: "mock_model", num_layers: 1, pattern: "T", forward_ms: { T: f } };
+    if (typeof mod.backward_ms === "number") m.backward_ms = { T: mod.backward_ms };
+    if (typeof mod.weight_ms === "number") m.weight_ms = { T: mod.weight_ms };
+    delete mod.forward_ms;
+    delete mod.backward_ms;
+    delete mod.weight_ms;
+    mod.model = m;
+  }
+  if (!m.name) m.name = "mock_model";
+  if (mod.recompute !== undefined) { // legacy top-level flag
+    if (mod.recompute) m.recompute = true;
+    delete mod.recompute;
+  }
+  return m;
+}
+const auxIsMock = (m) => (m.name || "mock_model") === "mock_model";
+
+/* keep every pattern type priced, like the backbone's ensurePatternTimes */
+function auxEnsureTimes(m) {
+  for (const sym of new Set(patBody(m.pattern || ""))) {
+    if ((m.forward_ms || {})[sym] === undefined) {
+      if (!m.forward_ms) m.forward_ms = {};
+      m.forward_ms[sym] = 0.5;
+    }
+  }
+}
+
+/* per-pass module totals in ms (sum over pattern layers, E/L included) for
+   the summary; profiled models read the profile's pattern + times */
+function auxTotals(m) {
+  const prof = auxIsMock(m) ? null : (DYN_OPTS.model_layers || {})[m.name];
+  const t = prof ? { f: prof.f || {}, b: prof.b || {}, w: prof.w || {} } : mockTables(m);
+  const pattern = prof ? prof.pattern : (m.pattern || "");
+  const tot = { f: 0, b: 0, w: 0 };
+  for (const c of expandPat(pattern)) {
+    tot.f += t.f[c] || 0;
+    tot.b += t.b[c] || 0;
+    tot.w += t.w[c] || 0;
+  }
+  return tot;
+}
+
+function removeAuxModule(role, idx) {
+  const list = auxList(role).slice();
+  list.splice(idx, 1);
+  if (list.length) cfgObj[role] = list; else delete cfgObj[role];
+  renderAuxModules();
+  scheduleDump();
+  scheduleAutoRun();
+}
+
+function auxCard(role, mod, idx) {
+  const isEnc = role === "encoders";
+  const card = document.createElement("div");
+  card.className = "aux-card";
+
+  const head = document.createElement("div");
+  head.className = "aux-head";
+  const badge = document.createElement("span");
+  badge.className = "aux-role " + (isEnc ? "enc" : "dec");
+  badge.textContent = `${isEnc ? "Encoder" : "Decoder"} ${idx + 1}`; // matches the gantt legend's Enc1/Dec1
+  const name = document.createElement("input");
+  name.type = "text";
+  name.className = "aux-name";
+  name.spellcheck = false;
+  name.placeholder = isEnc ? "encoder" : "decoder";
+  name.title = AUX_FIELD_DESC.name;
+  if (mod.name) name.value = mod.name;
+  name.addEventListener("input", () => {
+    const v = name.value.trim();
+    if (v) mod.name = v; else delete mod.name;
+    scheduleDump();
+    scheduleAutoRun();
+  });
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "aux-del";
+  del.textContent = "\u2212"; // minus sign
+  del.title = `Remove this ${isEnc ? "encoder" : "decoder"}`;
+  del.addEventListener("click", () => removeAuxModule(role, idx));
+  head.appendChild(badge);
+  head.appendChild(name);
+  head.appendChild(del);
+  card.appendChild(head);
+
+  /* --- the module's own model (a mini backbone-style model card) --- */
+  const m = auxNormalizeModel(mod);
+  const isMock = auxIsMock(m);
+  const prof = isMock ? null : (DYN_OPTS.model_layers || {})[m.name];
+
+  const grid = document.createElement("div");
+  grid.className = "fgrid";
+
+  // model selector: mock_model or any profiled model, like the backbone's
+  const mrow = document.createElement("div");
+  mrow.className = "frow";
+  mrow.title = AUX_FIELD_DESC.model;
+  const mlab = document.createElement("label");
+  mlab.textContent = "Model";
+  const msel = document.createElement("select");
+  const modelNames = (DYN_OPTS.models && DYN_OPTS.models.length)
+    ? DYN_OPTS.models : ["mock_model"];
+  for (const n of modelNames) {
+    const o = document.createElement("option");
+    o.value = n;
+    o.textContent = n;
+    msel.appendChild(o);
+  }
+  if (![...msel.options].some(o => o.value === m.name)) {
+    const o = document.createElement("option"); // model from YAML we don't know
+    o.value = m.name;
+    o.textContent = m.name;
+    msel.appendChild(o);
+  }
+  msel.value = m.name;
+  msel.title = AUX_FIELD_DESC.model;
+  msel.addEventListener("change", () => {
+    const n = msel.value;
+    const rc = m.recompute; // user intent survives the model swap
+    if (n === "mock_model") {
+      mod.model = { name: "mock_model", num_layers: 4, pattern: "T*4", forward_ms: { T: 0.5 } };
+    } else {
+      // profiled model: pattern / layers / times come from the profile, so
+      // the config only records which model (engine fills in the rest)
+      mod.model = { name: n };
+    }
+    if (rc) mod.model.recompute = true;
+    renderAuxModules();
+    scheduleDump();
+    scheduleAutoRun();
+  });
+  mrow.appendChild(mlab);
+  mrow.appendChild(msel);
+  grid.appendChild(mrow);
+
+  // layers <-> pattern, backbone-style: layers edits pad/truncate the
+  // pattern with T, pattern edits recount layers; locked for profiled
+  // models, whose shape comes from the profile
+  const lrow = document.createElement("div");
+  lrow.className = "frow";
+  lrow.title = AUX_FIELD_DESC.num_layers;
+  const llab = document.createElement("label");
+  llab.textContent = "Layers";
+  const linp = document.createElement("input");
+  linp.type = "number";
+  linp.min = "1";
+  linp.step = "1";
+  linp.value = prof
+    ? String(patBody(prof.pattern || "").length)
+    : String(patBody(m.pattern || "").length || 1);
+  lrow.appendChild(llab);
+  lrow.appendChild(linp);
+  grid.appendChild(lrow);
+
+  const patrow = document.createElement("div");
+  patrow.className = "frow";
+  patrow.title = AUX_FIELD_DESC.pattern;
+  const platb = document.createElement("label");
+  platb.textContent = "Pattern";
+  const pinp = document.createElement("input");
+  pinp.type = "text";
+  pinp.spellcheck = false;
+  pinp.placeholder = "T*4";
+  pinp.value = prof ? compressPat(prof.pattern || "") : (m.pattern || "");
+  patrow.appendChild(platb);
+  patrow.appendChild(pinp);
+  grid.appendChild(patrow);
+
+  if (!isMock) {
+    const lockNote = "Locked: comes from the model profile. Select mock_model to edit it.";
+    setLocked(linp, true, lockNote, AUX_FIELD_DESC.num_layers);
+    setLocked(pinp, true, lockNote, AUX_FIELD_DESC.pattern);
+  }
+  linp.addEventListener("change", () => {
+    const n = Number(linp.value);
+    if (!Number.isInteger(n) || n < 1) { linp.classList.add("invalid"); return; }
+    linp.classList.remove("invalid");
+    let body = patBody(m.pattern || "");
+    body = n > body.length
+      ? body.concat(Array(n - body.length).fill("T"))
+      : body.slice(0, n);
+    m.pattern = compressPat(body.join(""));
+    m.num_layers = n;
+    auxEnsureTimes(m);
+    renderAuxModules(); // the times table rows may change
+    scheduleDump();
+    scheduleAutoRun();
+  });
+  pinp.addEventListener("change", () => {
+    const v = pinp.value.trim();
+    const exp = expandPat(v);
+    if (!v || !PAT_CHARS.test(exp) || !patBody(v).length) {
+      pinp.classList.add("invalid");
+      return;
+    }
+    pinp.classList.remove("invalid");
+    m.pattern = v;
+    m.num_layers = patBody(v).length;
+    auxEnsureTimes(m);
+    renderAuxModules();
+    scheduleDump();
+    scheduleAutoRun();
+  });
+
+  // full activation recompute (B re-runs F first); lives on the module's
+  // model, exactly like the backbone's model.recompute
+  const rrow = document.createElement("div");
+  rrow.className = "frow";
+  rrow.title = AUX_FIELD_DESC.recompute;
+  const rlab = document.createElement("label");
+  rlab.textContent = "Recompute";
+  const rchk = document.createElement("input");
+  rchk.type = "checkbox";
+  rchk.checked = m.recompute === true;
+  rchk.addEventListener("change", () => {
+    if (rchk.checked) m.recompute = true;
+    else delete m.recompute;
+    renderAuxModules(); // the module-total line reflects the B = F+B fold
+    scheduleDump();
+    scheduleAutoRun();
+  });
+  rrow.appendChild(rlab);
+  rrow.appendChild(rchk);
+  grid.appendChild(rrow);
+
+  // placement select (+ device list input when explicit)
+  const prow = document.createElement("div");
+  prow.className = "frow";
+  const isList = Array.isArray(mod.placement);
+  prow.title = AUX_PLACE_DESC[isList ? "devices" : (mod.placement || "first_stage")];
+  const plab = document.createElement("label");
+  plab.textContent = "Placement";
+  const sel = document.createElement("select");
+  for (const p of AUX_PLACEMENTS.concat(["devices"])) {
+    const o = document.createElement("option");
+    o.value = p;
+    o.textContent = p === "devices" ? "device list\u2026" : p.replace("_", " ");
+    o.title = AUX_PLACE_DESC[p];
+    sel.appendChild(o);
+  }
+  sel.value = isList ? "devices" : (mod.placement || (isEnc ? "first_stage" : "last_stage"));
+  sel.addEventListener("change", () => {
+    if (sel.value === "devices") mod.placement = Array.isArray(mod.placement) ? mod.placement : [0];
+    else mod.placement = sel.value;
+    renderAuxModules(); // device-list input appears/disappears
+    scheduleDump();
+    scheduleAutoRun();
+  });
+  prow.appendChild(plab);
+  prow.appendChild(sel);
+  grid.appendChild(prow);
+
+  if (isList) {
+    const drow = document.createElement("div");
+    drow.className = "frow";
+    drow.title = AUX_PLACE_DESC.devices;
+    const dlab = document.createElement("label");
+    dlab.textContent = "Devices";
+    const dinp = document.createElement("input");
+    dinp.type = "text";
+    dinp.spellcheck = false;
+    dinp.placeholder = "0, 1";
+    dinp.value = mod.placement.join(", ");
+    dinp.addEventListener("input", () => {
+      const items = dinp.value.replace(/[\[\]]/g, "").split(",")
+        .map(s => s.trim()).filter(s => s !== "");
+      const ids = items.map(Number);
+      if (!ids.length || ids.some(v => !Number.isInteger(v) || v < 0)) {
+        dinp.classList.add("invalid");
+        return;
+      }
+      dinp.classList.remove("invalid");
+      mod.placement = ids;
+      scheduleDump();
+      scheduleAutoRun();
+    });
+    drow.appendChild(dlab);
+    drow.appendChild(dinp);
+    grid.appendChild(drow);
+  }
+
+  card.appendChild(grid);
+  card.appendChild(auxTimesTable(mod, m));
+  return card;
+}
+
+/* per-layer-type F/B/W table of an aux module's model, mirroring the
+   backbone's renderModelTimes: editable ms inputs for mock_model, read-only
+   profile values for profiled models */
+function auxTimesTable(mod, m) {
+  const wrap = document.createElement("div");
+  wrap.className = "aux-times";
+  const prof = auxIsMock(m) ? null : (DYN_OPTS.model_layers || {})[m.name];
+  const t = prof ? { f: prof.f || {}, b: prof.b || {}, w: prof.w || {} } : mockTables(m);
+  const pattern = prof ? prof.pattern : (m.pattern || "");
+  const { counts, order } = typeCounts(expandPat(pattern));
+  const num = (v) => v === undefined || v === null ? "" : String(v);
+  const ro = prof ? " disabled" : "";
+  // "N" instead of "Count": the cards sit two abreast so columns are narrow
+  let html = `<div class="mt-row mt-head"><span></span><span>Type</span>
+      <span title="Layer count">N</span><span>F <i class="unit">(ms)</i></span><span>B <i class="unit">(ms)</i></span><span>W <i class="unit">(ms)</i></span></div>`;
+  for (const c of order) {
+    const [cls, label] = SYM_INFO[c] || ["mlp", c];
+    const fixed = c === "E" || c === "L";
+    html += `<div class="mt-row${fixed ? " mt-fixed" : ""}">
+      <span class="mt-dot sym-${cls}"></span>
+      <span title="${labelize(label)} (${c})">${labelize(label)} (${c})</span>
+      <span>${counts[c]}</span>
+      <span><input type="number" step="any" min="0" data-sym="${c}" data-kind="forward_ms" value="${num(t.f[c])}"${ro}></span>
+      <span><input type="number" step="any" min="0" data-sym="${c}" data-kind="backward_ms" value="${num(t.b[c])}"${ro}></span>
+      <span><input type="number" step="any" min="0" data-sym="${c}" data-kind="weight_ms" value="${num(t.w[c])}"${ro}></span></div>`;
+  }
+  if (prof) html += `<div class="mt-note">Times come from the ${m.name} profile (read-only).</div>`;
+  html += `<div class="mt-note aux-sum"></div>`;
+  wrap.innerHTML = html;
+
+  const sum = wrap.querySelector(".aux-sum");
+  const updateSum = () => {
+    const tot = auxTotals(m);
+    const rc = m.recompute === true;
+    const b = rc ? tot.b + tot.f : tot.b; // recompute: B re-runs F
+    sum.textContent =
+      `Module per microbatch: F ${fmtMs(tot.f)} \u00b7 B ${fmtMs(b)}${rc ? " (recompute)" : ""} \u00b7 W ${fmtMs(tot.w)} ms`;
+  };
+  updateSum();
+
+  for (const inp of wrap.querySelectorAll("input[data-sym]:not([disabled])")) {
+    inp.addEventListener("change", () => {
+      const v = inp.value.trim() === "" ? undefined : Number(inp.value);
+      if (v !== undefined && (!Number.isFinite(v) || v < 0)) return;
+      const kind = inp.dataset.kind, sym = inp.dataset.sym;
+      if (!m[kind]) m[kind] = {};
+      if (v === undefined) delete m[kind][sym];
+      else m[kind][sym] = v;
+      if (!Object.keys(m[kind]).length) delete m[kind];
+      updateSum();
+      scheduleDump();
+      scheduleAutoRun();
+    });
+  }
+  return wrap;
+}
+
+function renderAuxModules() {
+  const root = $("aux-modules");
+  if (!root) return;
+  root.innerHTML = "";
+  let migrated = false;
+  for (const role of ["encoders", "decoders"])
+    auxList(role).forEach((mod, idx) => {
+      // flat scalars -> model, or a legacy top-level recompute flag
+      if (!(mod.model && (mod.model.pattern || mod.model.name)) || mod.recompute !== undefined)
+        migrated = true;
+      root.appendChild(auxCard(role, mod, idx));
+    });
+  if (migrated) scheduleDump(); // keep the YAML view in sync with the fold
 }
 
 /* ============ partition / placement visual editor ============
@@ -732,6 +1159,8 @@ function renderModelTimes() {
     if (!isMock) pe.value = lmSel && lmSel.pattern ? compressPat(lmSel.pattern) : "";
     setLocked(pe, !isMock, "Locked: the pattern comes from the model profile. " +
       "Select mock_model to edit it.", fieldDesc("model.pattern"));
+    // the box is narrow: hovering shows the full pattern above the field help
+    if (pe.value) pe.title = `${pe.value}\n\n${pe.title}`;
   }
   const nlEl = document.querySelector('[data-path="model.num_layers"]');
   if (nlEl) setLocked(nlEl, !isMock, "Locked: the layer count comes from the " +
@@ -934,6 +1363,47 @@ function ppStageBox(s, stages) {
   return box;
 }
 
+/* Where each encoder/decoder copy lives, mirroring the engine's placement
+   rules (first_stage / last_stage / replicated / dedicated / device list).
+   Returns { byRank: Map<rank, item[]>, dedicated: item[] }. */
+function ppAuxDistribution(stages, nRanks) {
+  const out = { byRank: new Map(), dedicated: [] };
+  const rankOf = (sid) => {
+    const st = stages.find(s => s.sid === sid);
+    return st ? Math.min(st.rank, nRanks - 1) : 0;
+  };
+  const maxSid = stages.length ? Math.max(...stages.map(s => s.sid)) : 0;
+  const add = (r, item) => {
+    if (r < 0 || r >= nRanks) return;
+    if (!out.byRank.has(r)) out.byRank.set(r, []);
+    out.byRank.get(r).push(item);
+  };
+  const walk = (mods, isEnc) => (mods || []).forEach((mod, i) => {
+    const item = {
+      label: (isEnc ? "Enc" : "Dec") + (i + 1),
+      enc: isEnc,
+      title: `${mod.name || (isEnc ? "encoder" : "decoder")} — ` +
+        (Array.isArray(mod.placement) ? `devices [${mod.placement.join(", ")}]`
+          : (mod.placement || (isEnc ? "first_stage" : "last_stage"))),
+    };
+    const p = mod.placement || (isEnc ? "first_stage" : "last_stage");
+    if (Array.isArray(p)) p.forEach(r => add(r, item));
+    else if (p === "replicated") for (let r = 0; r < nRanks; r++) add(r, item);
+    else if (p === "dedicated") out.dedicated.push(item);
+    else if (p === "last_stage") add(rankOf(maxSid), item);
+    else add(rankOf(0), item);
+  });
+  walk(cfgObj.encoders, true);
+  walk(cfgObj.decoders, false);
+  return out;
+}
+function ppAuxBadges(items) {
+  if (!items || !items.length) return "";
+  return " " + items.map(it =>
+    `<span class="aux-role ${it.enc ? "enc" : "dec"}" title="${escHtml(it.title)}">${escHtml(it.label)}</span>`
+  ).join(" ");
+}
+
 function renderPartPlace() {
   const body = $("partplace-body");
   if (!body) return;
@@ -946,13 +1416,15 @@ function renderPartPlace() {
   $("pp-auto").style.display = manual ? "" : "none";
 
   const nRanks = Math.max(ppSize(), ...stages.map(s => s.rank + 1));
+  const aux = ppAuxDistribution(stages, nRanks);
   body.innerHTML = "";
   const ranksBox = document.createElement("div");
   ranksBox.className = "pp-ranks" + (ppLayout === "tiled" ? " tiled" : "");
   for (let r = 0; r < nRanks; r++) {
     const row = document.createElement("div");
     row.className = "pp-rank";
-    row.innerHTML = `<div class="pp-rank-label">Rank ${r}</div><div class="pp-rank-stages"></div>`;
+    row.innerHTML = `<div class="pp-rank-label">Rank ${r}${ppAuxBadges(aux.byRank.get(r))}</div>` +
+      `<div class="pp-rank-stages"></div>`;
     const cont = row.querySelector(".pp-rank-stages");
     for (const s of stages) {
       if (Math.min(s.rank, nRanks - 1) === r) cont.appendChild(ppStageBox(s, stages));
@@ -970,6 +1442,14 @@ function renderPartPlace() {
     });
     ranksBox.appendChild(row);
   }
+  // dedicated encoder/decoder hosts occupy extra devices past the backbone
+  aux.dedicated.forEach((item, i) => {
+    const row = document.createElement("div");
+    row.className = "pp-rank pp-rank-aux";
+    row.innerHTML = `<div class="pp-rank-label">Rank ${nRanks + i}${ppAuxBadges([item])}</div>` +
+      `<div class="pp-rank-stages"><span class="pp-aux-note">dedicated device — no backbone stage</span></div>`;
+    ranksBox.appendChild(row);
+  });
   body.appendChild(ranksBox);
 
   const part = stages.map(s => s.layers);
@@ -1219,20 +1699,34 @@ $("export-btn").addEventListener("click", async () => {
   let text = $("config").value;
   // A profiled model is just a name that references on-disk profile data;
   // inline its pattern + per-type times (same shape alignMockToModel makes)
-  // so the exported file runs on machines without any profiles.
+  // so the exported file runs on machines without any profiles.  Aux
+  // modules are models too, so their profiled models inline the same way.
+  const inlineTimes = (mdl, lm2) => {
+    mdl.pattern = compressPat(lm2.pattern);
+    mdl.forward_ms = { ...(lm2.f || {}) };
+    mdl.backward_ms = { ...(lm2.b || {}) };
+    mdl.weight_ms = { ...(lm2.w || {}) };
+    mdl.num_layers = patBody(mdl.pattern).length;
+    mdl.name = "mock_model";
+  };
+  const cfg = JSON.parse(JSON.stringify(cfgObj));
+  let changed = false;
   const name = getPath(cfgObj, "model.name");
   const lm = (DYN_OPTS.model_layers || {})[name];
   if (name !== "mock_model" && lm && lm.pattern) {
-    const cfg = JSON.parse(JSON.stringify(cfgObj));
     Object.assign(cfg.model, (DYN_OPTS.model_meta || {})[name] || {});
-    cfg.model.name = "mock_model";
     for (const k of ["layer_time", "layer_f_time", "layer_b_time", "layer_w_time"])
       delete cfg.model[k];
-    cfg.model.pattern = compressPat(lm.pattern);
-    cfg.model.forward_ms = { ...(lm.f || {}) };
-    cfg.model.backward_ms = { ...(lm.b || {}) };
-    cfg.model.weight_ms = { ...(lm.w || {}) };
-    cfg.model.num_layers = patBody(cfg.model.pattern).length;
+    inlineTimes(cfg.model, lm);
+    changed = true;
+  }
+  for (const role of ["encoders", "decoders"])
+    for (const mod of (Array.isArray(cfg[role]) ? cfg[role] : [])) {
+      const mn = mod.model && mod.model.name;
+      const mlm = mn && mn !== "mock_model" && (DYN_OPTS.model_layers || {})[mn];
+      if (mlm && mlm.pattern) { inlineTimes(mod.model, mlm); changed = true; }
+    }
+  if (changed) {
     try {
       const resp = await fetch("/api/dump", {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -1286,18 +1780,25 @@ function renderRanks(rows) {
     $("ranks-body").innerHTML = "<div class='placeholder'>No per-rank data.</div>";
     return;
   }
+  // Aux column only exists when some rank hosts an encoder/decoder copy
+  const hasAux = rows.some(r => (r.aux || []).length);
   let html = `<div class="tbl-wrap"><table><thead><tr>
-    <th>Rank</th><th>Stages</th><th>Layers</th><th>Comp</th><th>Bubble</th><th>Bubble %</th>
+    <th>Rank</th><th>Stages</th><th>Layers</th>${hasAux ? "<th>Enc / Dec</th>" : ""}<th>Comp</th><th>Bubble</th><th>Bubble %</th>
     <th>Warm / cool / resid</th><th>Model <span class="unit">(GB)</span></th><th>Act <span class="unit">(GB)</span></th><th>Peak <span class="unit">(GB)</span></th><th>Status</th>
   </tr></thead><tbody>`;
   for (const row of rows) {
-    const layers = row.layers.join("+") + (row.layers.length > 1 ? ` = ${row.layers.reduce((a, b) => a + b, 0)}` : "");
+    const layers = !row.layers.length ? "-"
+      : row.layers.join("+") + (row.layers.length > 1 ? ` = ${row.layers.reduce((a, b) => a + b, 0)}` : "");
     const status = row.feasible === undefined || row.feasible === null ? "-"
       : row.feasible ? "<span class='badge ok'>OK</span>" : "<span class='badge bad'>OOM</span>";
+    const stages = row.stages.length ? `[${row.stages.join(", ")}]` : "aux only";
+    const auxCell = hasAux
+      ? `<td>${(row.aux || []).map(auxRankBadge).join(" ") || "-"}</td>`
+      : "";
     html += `<tr>
-      <td>D${row.rank}</td><td>[${row.stages.join(", ")}]</td><td>${layers}</td>
+      <td>D${row.rank}</td><td>${stages}</td><td>${layers}</td>${auxCell}
       <td>${fmtNum(row.comp)}</td><td>${fmtNum(row.bubble)}</td>
-      <td>${(row.bubble_ratio * 100).toFixed(2)}%</td>
+      <td>${row.bubble_ratio === null || row.bubble_ratio === undefined ? "-" : (row.bubble_ratio * 100).toFixed(2) + "%"}</td>
       <td>${fmtNum(row.warmup_bubble)} / ${fmtNum(row.cooldown_bubble)} / ${fmtNum(row.residual_bubble)}</td>
       <td>${fmtGb(row.model_state_gb)}</td><td>${fmtGb(row.activation_peak_gb)}</td>
       <td>${fmtGb(row.peak_gb)}</td><td>${status}</td>
@@ -1305,6 +1806,16 @@ function renderRanks(rows) {
   }
   html += "</tbody></table></div>";
   $("ranks-body").innerHTML = html;
+}
+/* "enc:vit@d0" -> small role-colored chip labeled with the module name */
+function auxRankBadge(tag) {
+  const enc = tag.startsWith("enc:");
+  const name = escHtml(tag.slice(4));
+  return `<span class="aux-role ${enc ? "enc" : "dec"}">${name}</span>`;
+}
+function escHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 /* ================= gantt: canvas renderer + region zoom ================= */
@@ -1367,6 +1878,31 @@ $("range-fill").addEventListener("mousedown", (ev) => {
 });
 
 const GANTT_COLORS = { F: "#E8C66A", B: "#94B8E8", W: "#8FBD8C", R: "#F8CECC" };
+/* Multimodal modules use their own palettes (block kind "enc:*" / "dec:*")
+   so encoder / backbone / decoder blocks are distinguishable at a glance;
+   within a palette F is lightest and W darkest.  Encoders draw from warm
+   hues and decoders from cool violets; each module gets its own palette
+   (assigned by name below, wrapping if there are more modules than hues). */
+const AUX_PALETTES = {
+  enc: [
+    { F: "#F2A6A6", B: "#E37B7B", W: "#CE5757", R: "#FAE3E3" }, // red
+    { F: "#F6C08F", B: "#EC9A4E", W: "#D97B23", R: "#FBE7D0" }, // orange
+    { F: "#F2A6CD", B: "#E37BAE", W: "#CE578F", R: "#FAE3F0" }, // rose
+    { F: "#E0B48C", B: "#C98F5A", W: "#A96F38", R: "#F3E4D3" }, // copper
+    { F: "#F8B3A0", B: "#EF8A6C", W: "#D96846", R: "#FCE5DD" }, // coral
+  ],
+  dec: [
+    { F: "#CDB6F2", B: "#A98BE3", W: "#8A66CE", R: "#EBE0FA" }, // purple
+    { F: "#B3B8F0", B: "#8890E0", W: "#6470CC", R: "#E2E4FA" }, // indigo
+    { F: "#E0AEE0", B: "#C883C8", W: "#A95FA9", R: "#F5E0F5" }, // plum
+    { F: "#B9C8F2", B: "#8FA5E3", W: "#6B84CE", R: "#E4EAFA" }, // periwinkle
+    { F: "#C3A6E8", B: "#9C74D4", W: "#7B52B8", R: "#EDE2F8" }, // violet
+  ],
+};
+/* kind ("enc:vit") -> palette, rebuilt per run in setupGantt */
+let auxKindPalette = {};
+const blockPalette = (kind) =>
+  kind ? auxKindPalette[kind] || GANTT_COLORS : GANTT_COLORS;
 const GANTT_GUTTER = 40, GANTT_AXIS_H = 22;
 /* Stable, well-spread accent per micro batch (used for pins and connectors). */
 const pathColor = (mid) => `hsl(${(mid * 61) % 360} 60% 36%)`;
@@ -1443,7 +1979,7 @@ function drawGantt() {
     ctx.stroke();
 
     const y = yMid - bh / 2;
-    for (const [s, e, w, mid] of dev.blocks) {
+    for (const [s, e, w, mid, , kind] of dev.blocks) {
       if (e <= g.t0 || s >= g.t1) continue;
       const x0 = Math.max(g.xOf(s), GANTT_GUTTER);
       const x1 = Math.min(g.xOf(e), GANTT_GUTTER + g.plotW);
@@ -1451,7 +1987,7 @@ function drawGantt() {
       const isActive = activeMids.has(mid);
       const dimmed = anyActive && !isActive;
       ctx.globalAlpha = dimmed ? 0.22 : 1;
-      ctx.fillStyle = GANTT_COLORS[w] || "#cccccc";
+      ctx.fillStyle = blockPalette(kind)[w] || "#cccccc";
       ctx.beginPath();
       if (ctx.roundRect) ctx.roundRect(x0, y, bw, bh, Math.min(3, bw / 3));
       else ctx.rect(x0, y, bw, bh);
@@ -1527,6 +2063,50 @@ function ganttHit(mx, my) {
 
 function setupGantt(data) {
   const body = $("gantt-body");
+  // one palette + legend entry per multimodal module, labeled Enc1/Enc2/
+  // Dec1... to match the config card badges; the index follows the config's
+  // encoders/decoders array order so colors stay stable across reruns
+  // (encoders take warm hues, decoders cool ones, no repeats per role)
+  const kinds = new Set();
+  if (data && data.devices)
+    for (const d of data.devices)
+      for (const b of d.blocks) if (b[5]) kinds.add(b[5]);
+  auxKindPalette = {};
+  const legend = $("legend-aux");
+  legend.textContent = "";
+  // group replicated / device-list shards ("vit@d0", "vit@d1", ...) under
+  // their module, so all copies share one legend entry and one color
+  const modules = new Map(); // "enc:vit" -> {role, name, i, kinds: []}
+  for (const kind of kinds) {
+    const role = kind.slice(0, 3);
+    const name = kind.slice(4).replace(/@d\d+$/, "");
+    const key = role + ":" + name;
+    if (!modules.has(key)) {
+      const list = (role === "enc" ? cfgObj.encoders : cfgObj.decoders) || [];
+      modules.set(key, { role, name, i: list.findIndex((m) => (m && m.name) === name), kinds: [] });
+    }
+    modules.get(key).kinds.push(kind);
+  }
+  const seen = { enc: 0, dec: 0 };
+  const entries = [...modules.values()]
+    .sort((a, b) => (a.role === b.role ? a.i - b.i : a.role === "enc" ? -1 : 1));
+  for (const ent of entries) {
+    if (ent.i < 0) ent.i = seen[ent.role]++; // config out of sync: order seen
+    const pal = AUX_PALETTES[ent.role];
+    if (!pal) continue;
+    const colors = pal[ent.i % pal.length];
+    for (const kind of ent.kinds) auxKindPalette[kind] = colors;
+    const copies = ent.kinds.length > 1 ? `, ${ent.kinds.length} copies` : "";
+    const key = document.createElement("span");
+    key.className = "key";
+    key.title = `${ent.name} (${ent.role === "enc" ? "encoder" : "decoder"} ${ent.i + 1}${copies}); ` +
+      "its F/B/W share this palette";
+    const sw = document.createElement("i");
+    sw.style.setProperty("--c", colors.B);
+    key.appendChild(sw);
+    key.appendChild(document.createTextNode(`${ent.role === "enc" ? "Enc" : "Dec"}${ent.i + 1}`));
+    legend.appendChild(key);
+  }
   if (!data || !data.devices || !data.devices.length) {
     body.innerHTML = "<div class='placeholder'>No scheduling records.</div>";
     gantt = null;
@@ -1566,9 +2146,12 @@ function setupGantt(data) {
     const hoverMid = hit ? hit.b[3] : null;
     if (hoverMid !== gantt.hoverMid) { gantt.hoverMid = hoverMid; drawGantt(); }
     if (!hit) { tip.style.display = "none"; return; }
-    const [s, e, w, mid, sid] = hit.b;
+    const [s, e, w, mid, sid, kind] = hit.b;
+    const who = kind
+      ? `${kind.slice(4)} (${kind.startsWith("enc") ? "encoder" : "decoder"})`
+      : `sid=${sid}`;
     tip.textContent =
-      `${w} mid=${mid} sid=${sid} D${hit.dev.did}  ` +
+      `${w} mid=${mid} ${who} D${hit.dev.did}  ` +
       `${Math.round(s).toLocaleString()} – ${Math.round(e).toLocaleString()} (${Math.round(e - s).toLocaleString()})`;
     const hostRect = host.getBoundingClientRect();
     let lx = ev.clientX - hostRect.left + 14, ly = ev.clientY - hostRect.top + 14;
@@ -1764,9 +2347,62 @@ function showError(message, tb) {
   };
 }
 let runInflight = false, runQueued = false;
+
+/* Session-wide run history.  The array is chronological with the current
+   run last; the dropdown pins the current run on top (not clickable) and
+   lists the older runs below it in time order.  Restoring an entry moves
+   it back to the current slot instead of appending a duplicate. */
+const runHistory = []; // { ms, yaml, at }
+let pendingRestore = null; // entry the in-flight run is restoring, if any
+function renderHistory() {
+  $("hist-wrap").hidden = runHistory.length === 0;
+  const pop = $("hist-pop");
+  pop.textContent = "";
+  if (!runHistory.length) return;
+  const order = [runHistory.length - 1, ...runHistory.slice(0, -1).keys()];
+  for (const i of order) {
+    const h = runHistory[i];
+    const isCur = i === runHistory.length - 1;
+    const row = document.createElement("div");
+    row.className = "hist-row" + (isCur ? " current" : "");
+    const idx = document.createElement("span");
+    idx.className = "hist-idx";
+    idx.textContent = `#${i + 1}`;
+    const ms = document.createElement("b");
+    ms.textContent = `${h.ms.toFixed(2)} ms`;
+    const at = document.createElement("span");
+    at.className = "hist-at";
+    at.textContent = h.at.toTimeString().slice(0, 8);
+    row.append(idx, ms, at);
+    if (!isCur) {
+      row.title = "Restore this run's config";
+      row.addEventListener("click", () => {
+        pop.hidden = true;
+        if (!confirm(`Restore the config of run #${i + 1} (${h.ms.toFixed(2)} ms)?`)) return;
+        pendingRestore = h;
+        setConfigText(h.yaml);
+        clearTimeout(autoRunTimer); // one deliberate run, not the debounced one
+        run();
+      });
+    }
+    pop.appendChild(row);
+  }
+}
+$("hist-btn").addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  const pop = $("hist-pop");
+  pop.hidden = !pop.hidden;
+  if (!pop.hidden) pop.scrollTop = 0; // current sits on top
+});
+document.addEventListener("click", (ev) => {
+  if (!$("hist-wrap").contains(ev.target)) $("hist-pop").hidden = true;
+});
+
 async function run() {
   if (runInflight) { runQueued = true; return; }
   runInflight = true;
+  const restoring = pendingRestore; // consumed by this run only
+  pendingRestore = null;
   const btn = $("run-btn");
   btn.disabled = true; btn.textContent = "Running...";
   $("toast").style.display = "none";
@@ -1780,10 +2416,11 @@ async function run() {
   const timerTick = setInterval(() => { timerEl.textContent = elapsed(); }, 100);
   try {
     await flushDump(); // form edits land in the YAML before running
+    const cfgSnapshot = $("config").value; // what History restores later
     const resp = await fetch("/api/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ config: $("config").value }),
+      body: JSON.stringify({ config: cfgSnapshot }),
     });
     const r = await resp.json();
     if (!r.ok) { showError(r.error || "run failed", r.traceback); return; }
@@ -1796,7 +2433,22 @@ async function run() {
     $("config-out").textContent = r.pipeline_config;
     $("dl-svg").disabled = false;
     $("dl-config").disabled = false;
-    $("gen-time").textContent = "generated in " + elapsed();
+    // wall-clock generation time + this run's simulated pipeline time; the
+    // History dropdown holds every previous run for comparison / restore
+    const exeMs = r.makespan / 100;
+    $("gen-time").textContent =
+      `Generated in ${elapsed()} \u00b7 Exe time: ${exeMs.toFixed(2)} ms`;
+    if (restoring && cfgSnapshot === restoring.yaml) {
+      // a restore re-promotes the old entry to the current slot, no duplicate
+      const k = runHistory.indexOf(restoring);
+      if (k >= 0) runHistory.splice(k, 1);
+      restoring.ms = exeMs;
+      restoring.at = new Date();
+      runHistory.push(restoring);
+    } else {
+      runHistory.push({ ms: exeMs, yaml: cfgSnapshot, at: new Date() });
+    }
+    renderHistory();
   } catch (e) {
     showError("Request failed: " + e);
   } finally {

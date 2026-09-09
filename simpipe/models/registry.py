@@ -8,12 +8,10 @@ import yaml
 
 from simpipe.config.model import ModelConfig
 from simpipe.config.sim_config import SimConfig
-from simpipe.models.pattern import (
-    expand_pattern,
-    stack_layer_count,
-    stack_layer_symbols,
-)
-from simpipe.models.profile_times import ProfileTimes, profile_times_from_preset
+from simpipe.models.pattern import (expand_pattern, stack_layer_count,
+                                    stack_layer_symbols)
+from simpipe.models.profile_times import (ProfileTimes,
+                                          profile_times_from_preset)
 
 # Fitted per-model layer times (pattern + per-symbol f/b/w ms) live in
 # profiles/<name>.json at the repository root; PRESETS below only carries
@@ -274,6 +272,26 @@ def mock_profile_times(model: ModelConfig) -> ProfileTimes:
 
 def get_profile_times(name: str) -> ProfileTimes:
     return profile_times_from_preset(_timing_data(name))
+
+
+def profile_times_for_model(model: ModelConfig) -> ProfileTimes:
+    """ProfileTimes of one model config, whatever its timing source.
+
+    Mock/inline times take precedence, then an explicit profile_times_path
+    YAML, then the registry profile looked up by name.  model.recompute
+    folds the forward re-run into the backward times.  Shared by the
+    backbone (cli) and multimodal aux modules, which are models too.
+    """
+    if uses_mock_times(model):
+        pt = mock_profile_times(model)
+    elif model.profile_times_path:
+        data = yaml.safe_load(Path(model.profile_times_path).read_text())
+        pt = profile_times_from_preset(data).slice_layers(model.num_layers)
+    else:
+        pt = get_profile_times(model.name).slice_layers(model.num_layers)
+    if model.recompute:
+        pt = pt.with_full_recompute()
+    return pt
 
 
 def get_layer_times(name: str) -> tuple[list[float], list[float], list[float]]:

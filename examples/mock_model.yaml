@@ -17,6 +17,28 @@ model:
   forward_ms:
     T: 1.0
 
+# One multimodal encoder + decoder around the backbone (both are models
+# themselves; see examples/multimodal.yaml for every placement option).
+encoders:
+- name: encoder1
+  model:
+    name: mock_model
+    num_layers: 4
+    pattern: T*4
+    forward_ms:
+      T: 0.5
+  placement: first_stage
+
+decoders:
+- name: decoder1
+  model:
+    name: mock_model
+    num_layers: 4
+    pattern: T*4
+    forward_ms:
+      T: 0.5
+  placement: last_stage
+
 parallel:
   pp_size: 8
   micro_batch_num: 16

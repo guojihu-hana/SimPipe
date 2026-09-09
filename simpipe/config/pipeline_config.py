@@ -40,6 +40,50 @@ def _format_stage_layers(stage_layers: list[str]) -> list[str]:
     return [f"{idx}: {pattern}" for idx, pattern in enumerate(stage_layers)]
 
 
+def _aux_modules_from_plan(aux_plan) -> list[dict[str, Any]] | None:
+    """Serialize multimodal encoder/decoder copies for the pipeline config.
+
+    One entry per physical copy: the aux stage id used in scheduling rows,
+    the hosting device, and the microbatch shard it processes.
+    """
+    if aux_plan is None or not aux_plan.instances:
+        return None
+    return [
+        {
+            "name": inst.name,
+            "role": inst.role,
+            "sid": inst.aux_sid,
+            "device": inst.device_id,
+            "microbatches": list(inst.mids),
+            "forward_ticks": inst.f_ticks,
+            "backward_ticks": inst.b_ticks,
+            "weight_ticks": inst.w_ticks,
+        }
+        for inst in aux_plan.instances
+    ]
+
+
+def _format_aux_modules_yaml(aux_modules: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "aux_modules:  # multimodal copies; scheduling rows use their sid "
+        "(numbered past the backbone stages)"
+    ]
+    for mod in aux_modules:
+        lines.extend(
+            [
+                f"- name: {mod['name']}",
+                f"  role: {mod['role']}",
+                f"  sid: {mod['sid']}",
+                f"  device: {mod['device']}",
+                f"  microbatches: {_format_inline_list(mod['microbatches'])}",
+                f"  forward_ticks: {mod['forward_ticks']}",
+                f"  backward_ticks: {mod['backward_ticks']}",
+                f"  weight_ticks: {mod['weight_ticks']}",
+            ]
+        )
+    return lines
+
+
 def format_pipeline_config_yaml(
     *,
     schedule: str,
@@ -51,6 +95,7 @@ def format_pipeline_config_yaml(
     stage_layers: list[str] | None = None,
     memory: dict[str, Any] | None = None,
     batch_order: list[int] | None = None,
+    aux_modules: list[dict[str, Any]] | None = None,
 ) -> str:
     lines = [
         f"schedule: {schedule}",
@@ -68,6 +113,8 @@ def format_pipeline_config_yaml(
             "(E=embedding, M=mamba, -=mlp, *=attn, T=transformer, #=moe, L=head)"
         )
         lines.extend(f'- "{entry}"' for entry in _format_stage_layers(stage_layers))
+    if aux_modules:
+        lines.extend(_format_aux_modules_yaml(aux_modules))
     lines.extend(
         [
             "scheduling:  # (workload_type, mid, sid, did, start_time, end_time)",
@@ -94,6 +141,7 @@ def build_pipeline_config(
     stage_layers: list[str] | None = None,
     memory: dict[str, Any] | None = None,
     batch_order: list[int] | None = None,
+    aux_modules: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     data: dict[str, Any] = {
         "schedule": schedule,
@@ -111,6 +159,8 @@ def build_pipeline_config(
         data["memory"] = memory
     if batch_order is not None:
         data["batch_order"] = batch_order
+    if aux_modules is not None:
+        data["aux_modules"] = aux_modules
     return data
 
 
@@ -149,6 +199,7 @@ def build_pipeline_config_from_executor(
         stage_layers=stage_layers,
         memory=memory,
         batch_order=executor.plan.mid_order,
+        aux_modules=_aux_modules_from_plan(getattr(executor.plan, "aux_plan", None)),
     )
 
 
@@ -196,6 +247,7 @@ def write_pipeline_config(
             stage_layers=data.get("stage_layers"),
             memory=data.get("memory"),
             batch_order=data.get("batch_order"),
+            aux_modules=data.get("aux_modules"),
         )
     )
 
@@ -229,6 +281,9 @@ def _format_memory_yaml(memory: dict[str, Any]) -> list[str]:
                 f"    p2p_buffer_gb: {device.get('p2p_buffer_gb', 0)}",
             ]
         )
+        aux = device.get("aux_modules")
+        if aux:
+            lines.append(f"    aux_modules: [{', '.join(aux)}]")
     return lines
 
 

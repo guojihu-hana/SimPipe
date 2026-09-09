@@ -141,6 +141,27 @@
     font-variant-numeric: tabular-nums;
   }
   .gen-time { font-size: 11px; color: var(--muted, #64748b); white-space: nowrap; }
+  /* run-history dropdown: chronological list, click a row to restore */
+  .hist-wrap { position: relative; display: inline-flex; }
+  #hist-pop {
+    position: absolute; top: calc(100% + 6px); right: 0; z-index: 130;
+    min-width: 215px; max-height: 262px; overflow-y: auto; padding: 5px;
+    background: #fff; border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(15, 23, 42, .18); cursor: default;
+  }
+  .hist-row {
+    display: flex; align-items: baseline; gap: 9px; padding: 5px 9px;
+    border-radius: 7px; cursor: pointer; font-size: 11.5px; white-space: nowrap;
+  }
+  .hist-row:hover { background: #f1f5f9; }
+  .hist-row b { font-weight: 600; }
+  /* the pinned current run is informational only */
+  .hist-row.current { cursor: default; }
+  .hist-row.current:hover { background: none; }
+  .hist-row.current b::after { content: " (current)"; color: var(--muted); font-weight: 400; }
+  .hist-row.current + .hist-row { border-top: 1px solid #eef2f7; border-radius: 0 0 7px 7px; }
+  .hist-idx { color: var(--muted); min-width: 22px; }
+  .hist-at { color: var(--muted); margin-left: auto; font-size: 10.5px; }
   .keys-hint { font-size: 11px; color: var(--muted, #64748b); white-space: nowrap; margin-right: 2px; }
   .keys-hint kbd { margin: 0 1px; }
   /* "?" badge after the WASD hint; hovering it opens a rich cheat sheet */
@@ -260,14 +281,18 @@
   .pp-badge.manual { background: #fce7f3; color: #be185d; box-shadow: inset 0 0 0 1px rgba(190, 24, 93, .25); }
   .pp-badge.auto { background: #eef2ff; color: #4f46e5; box-shadow: inset 0 0 0 1px rgba(79, 70, 229, .2); }
   .pp-rank {
-    display: grid; grid-template-columns: 58px 1fr; gap: 8px; align-items: stretch;
+    display: grid; grid-template-columns: minmax(58px, auto) 1fr; gap: 8px; align-items: stretch;
     padding: 5px 0; border-bottom: 1px dashed #edf1f7;
   }
   .pp-ranks > .pp-rank:last-of-type { border-bottom: 0; }
   .pp-rank-label {
     font-size: 11px; font-weight: 700; color: #8593a8; display: flex; align-items: center;
-    text-transform: uppercase; letter-spacing: .4px;
+    text-transform: uppercase; letter-spacing: .4px; gap: 4px; flex-wrap: wrap;
   }
+  /* encoder/decoder chips reuse .aux-role; dedicated hosts get their own row */
+  .pp-rank-label .aux-role { font-size: 9px; padding: 1px 6px; }
+  .pp-rank-aux .pp-rank-stages { display: flex; align-items: center; }
+  .pp-aux-note { font-size: 11px; color: #97a3b6; font-style: italic; }
   .pp-rank.drop-ok { background: #f0f7ff; border-radius: 10px; }
   .pp-rank-stages { display: flex; flex-wrap: wrap; gap: 7px; min-height: 46px; align-items: stretch; }
   /* tiled layout: each rank becomes a card, cards flow side by side */
@@ -325,6 +350,48 @@
     cursor: default; border-style: dashed;
     background: #fdf3d7; border-color: #ecd393; color: #8a6d1a;
   }
+  /* model section: multimodal encoder/decoder cards */
+  /* encoder/decoder cards sit side by side; each card stacks its own rows */
+  #aux-modules {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 8px; margin-top: 8px; align-items: start;
+  }
+  #aux-modules:empty { display: none; }
+  .aux-card {
+    border: 1px solid var(--border); border-radius: 10px; padding: 7px 9px 5px;
+    background: #fbfcfe;
+  }
+  .aux-head { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; }
+  .aux-role {
+    font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+    padding: 2px 7px; border-radius: 999px; white-space: nowrap;
+  }
+  .aux-role.enc { background: #fde8e8; color: #b91c1c; }
+  .aux-role.dec { background: #ede4fb; color: #6d3fc4; }
+  .aux-head .aux-name {
+    flex: 1; min-width: 0; padding: 3px 8px; border: 1px solid var(--border); border-radius: 8px;
+    background: #fff; color: var(--text);
+    font: 11.5px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .aux-del {
+    padding: 0 9px; height: 22px; line-height: 20px; font-size: 14px;
+    border-radius: 8px; color: var(--muted); flex: none;
+  }
+  .aux-del:hover { color: #dc2626; border-color: #fca5a5; background: #fef2f2; }
+  .aux-times { margin-top: 6px; }
+  /* the cards sit two abreast, so the f/b/w table gets a tighter grid than
+     the backbone's #model-times: narrower fixed columns + shrinkable inputs */
+  .aux-times .mt-row {
+    grid-template-columns: 12px minmax(46px, 1fr) 26px repeat(3, minmax(36px, 58px));
+    gap: 4px; padding: 2.5px 2px;
+  }
+  .aux-times .mt-row > span {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  }
+  .aux-times .mt-row input[type="number"] { padding: 2px 3px; }
+  .aux-times .aux-sum { color: #64748b; font-size: 10.5px; padding-top: 3px; }
+  .aux-add-btns { display: flex; gap: 8px; }
+
   /* model section: per-layer-type time table */
   #model-times { margin-top: 7px; }
   .mt-row {

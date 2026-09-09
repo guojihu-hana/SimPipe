@@ -79,15 +79,31 @@ class PipelineRuntime:
         self.stall_flag = False
         self._last_progress_time = self.time
         self.peak_inflight_layers = 0
+        # Aux (encoder/decoder) dependency edges: completed-workload key ->
+        # workloads waiting on it.  Backbone-internal edges keep using the
+        # stage-adjacency propagation; every edge that touches an aux
+        # workload is registered here instead.
+        self._release_index: dict[WorkloadConstraint, list[tuple[Device, Workload]]] = {}
+        # Encoder activation throttle: in-flight microbatches (F started,
+        # B not finished) per aux stage id, capped by the aux plan's
+        # encoder_inflight_limit so encoders don't stockpile activations
+        # long before the backbone consumes them.
+        self._aux_inflight: dict[int, int] = {}
+        aux_plan = getattr(plan, "aux_plan", None)
+        self._aux_inflight_limit = (
+            aux_plan.encoder_inflight_limit if aux_plan is not None else None
+        )
         self._init_devices()
+        self._init_aux()
         self._init_dynamic_ready_queues()
         self.num_finished = 0
         self.total_workload = self._estimate_total_workloads()
 
     def _estimate_total_workloads(self) -> int:
+        aux_count = sum(d.aux_remaining for d in self.devices)
         if self.plan.static_schedule:
-            return sum(len(row) for row in self.plan.static_schedule)
-        count = 0
+            return sum(len(row) for row in self.plan.static_schedule) + aux_count
+        count = aux_count
         for device in self.devices:
             for stage in device.stages.values():
                 for wmap in stage.workloads.values():
@@ -97,8 +113,9 @@ class PipelineRuntime:
     def check_device_status(self, time: float) -> None:
         if self.plan.static_schedule:
             done = all(
-                d.next_workload_idx >= len(self.plan.static_schedule[d.did])
+                (not d.static_schedule or d.next_workload_idx >= len(d.static_schedule))
                 and d.state == Device.IDLE
+                and d.aux_remaining <= 0
                 for d in self.devices
             )
             if done:
@@ -115,6 +132,8 @@ class PipelineRuntime:
         # are given in ms and converted here.
         overhead = self.hardware.workload_overhead_ms * 100.0
         comm_time = self.hardware.comm_alpha_us / 1000.0 + self.hardware.p2p_latency_ms * 100.0
+        self._comm_time = comm_time
+        self._workload_overhead = overhead
         for did in range(self.device_num):
             dev = Device(
                 device_idx=did,
@@ -137,6 +156,201 @@ class PipelineRuntime:
             for device in self.devices
             for sid, stage in device.stages.items()
         }
+
+    def _init_aux(self) -> None:
+        """Materialize encoder/decoder workloads and wire their dependencies.
+
+        Data flow per microbatch: every encoder F -> backbone stage-0 F ->
+        ... -> last-stage F -> every decoder F -> decoder B -> last-stage B
+        -> ... -> stage-0 B -> every encoder B (aux W follows its own B when
+        bwd_split is on).  Multi-copy placements shard microbatches over the
+        copies, so each edge binds the one copy owning that microbatch to the
+        pipeline boundary stage.  All these edges are plain
+        WorkloadConstraints: cross-device ones pick up the P2P latency in
+        Workload.update_constraints, and completions are delivered through
+        self._release_index (see _propagate_constraints).
+        """
+        aux_plan = getattr(self.plan, "aux_plan", None)
+        if aux_plan is None:
+            return
+        from simpipe.pipeline.aux_modules import DECODER, ENCODER
+
+        # Dedicated aux devices continue the backbone's device ids.
+        for extra in range(aux_plan.extra_device_num):
+            self.devices.append(
+                Device(
+                    device_idx=self.device_num + extra,
+                    plan=self.plan,
+                    mid_offset=self.mid_offset,
+                    comp_power=self.hardware.comp_power,
+                    max_mem=self.hardware.gpu_hbm_gb,
+                    comm_time=self._comm_time,
+                    workload_overhead=self._workload_overhead,
+                    runtime=self,
+                )
+            )
+        dev_by_id = {d.did: d for d in self.devices}
+        stage_num = self.plan.stage_num
+        last_sid = stage_num - 1
+        placement = self.plan.placement.device_stages
+
+        def register(cstr: WorkloadConstraint, device: Device, workload: Workload) -> None:
+            self._release_index.setdefault(cstr, []).append((device, workload))
+
+        def gate(backbone_w: Workload, dev: Device, cstr: WorkloadConstraint) -> None:
+            """Make a backbone workload wait for an aux completion."""
+            backbone_w.constraints.add(cstr)
+            register(cstr, dev, backbone_w)
+
+        # Static schedules (everything but OctoPipe) splice anchored copies
+        # into the device's entry list so every microbatch runs
+        # enc F -> bb F ... bb B -> enc B in that order: encoder F right
+        # before the stage-0 F (no early warmup runs), encoder B right after
+        # the stage-0 B (later backbone Fs cannot push it back), decoder F+B
+        # right after the last-stage F.  A copy is anchored when it sits on
+        # the same device as its boundary stage; dedicated devices and
+        # off-anchor shards (replicated / explicit lists) keep backfilling.
+        splice_before: dict[int, dict[tuple, list[tuple]]] = {}
+        splice_after: dict[int, dict[tuple, list[tuple]]] = {}
+
+        for inst in aux_plan.instances:
+            dev = dev_by_id[inst.device_id]
+            b_ticks = inst.b_ticks if self.bwd_split else inst.b_ticks + inst.w_ticks
+            w_ticks = inst.w_ticks if self.bwd_split else 0.0
+            # encoders feed backbone stage 0, decoders sit behind the last
+            # stage; the copy only wires the microbatches in its shard
+            attach_sids = [0] if inst.role == ENCODER else [last_sid]
+            anchor_sid = attach_sids[0]
+            anchored = (
+                dev.static_schedule is not None
+                and self._stage_index[anchor_sid][0].did == inst.device_id
+            )
+
+            for local_mid in inst.mids:
+                mid = local_mid + self.mid_offset
+
+                def make(wtype: WorkloadType, duration: float) -> Workload:
+                    w = Workload(
+                        schedule_method=self.plan.schedule,
+                        device_idx=inst.device_id,
+                        microbatch_idx=mid,
+                        stage_idx=inst.aux_sid,
+                        bwd_split=self.bwd_split,
+                        duration=duration,
+                        total_stage_num=stage_num,
+                        wtype=wtype,
+                        recomp=False,
+                        split_recomp=False,
+                        comp_power=self.hardware.comp_power,
+                        vocab_parallel=False,
+                        placement=placement,
+                        comm_time=self._comm_time,
+                    )
+                    # aux dependencies are wired explicitly below
+                    w.constraints.clear()
+                    w.is_aux = True
+                    w.aux_name = inst.name
+                    w.aux_role = inst.role
+                    return w
+
+                f_w = make(WorkloadType.F, inst.f_ticks)
+                b_w = make(WorkloadType.B, b_ticks)
+                w_w = make(WorkloadType.W, w_ticks) if w_ticks > 0 else None
+                f_done = WorkloadConstraint(inst.device_id, mid, inst.aux_sid, WorkloadType.F)
+                b_done = WorkloadConstraint(inst.device_id, mid, inst.aux_sid, WorkloadType.B)
+
+                if inst.role == ENCODER:
+                    # encoder F has no upstream; backbone F waits for it
+                    for sid in attach_sids:
+                        s_dev, s_stage = self._stage_index[sid]
+                        bf = s_stage.get_workload(mid, WorkloadType.F)
+                        if bf is not None:
+                            gate(bf, s_dev, f_done)
+                        # encoder B waits for the attached stage's B (input
+                        # gradients flow back over the same link)
+                        bb = s_stage.get_workload(mid, WorkloadType.B)
+                        if bb is not None:
+                            cstr = WorkloadConstraint(s_dev.did, mid, sid, WorkloadType.B)
+                            b_w.constraints.add(cstr)
+                            register(cstr, dev, b_w)
+                else:  # DECODER
+                    for sid in attach_sids:
+                        s_dev, s_stage = self._stage_index[sid]
+                        # decoder F waits for the attached stage's F
+                        bf = s_stage.get_workload(mid, WorkloadType.F)
+                        if bf is not None:
+                            cstr = WorkloadConstraint(s_dev.did, mid, sid, WorkloadType.F)
+                            f_w.constraints.add(cstr)
+                            register(cstr, dev, f_w)
+                        # the attached stage's B waits for decoder B (the
+                        # loss sits behind the decoders)
+                        bb = s_stage.get_workload(mid, WorkloadType.B)
+                        if bb is not None:
+                            gate(bb, s_dev, b_done)
+                    # loss turnaround inside the decoder: B after own F
+                    b_w.constraints.add(f_done)
+                    register(f_done, dev, b_w)
+
+                if inst.role == ENCODER:
+                    # encoder B additionally needs its own F to have run
+                    b_w.constraints.add(f_done)
+                    register(f_done, dev, b_w)
+                if w_w is not None:
+                    w_w.constraints.add(b_done)
+                    register(b_done, dev, w_w)
+
+                if anchored:
+                    before = splice_before.setdefault(inst.device_id, {})
+                    after = splice_after.setdefault(inst.device_id, {})
+                    f_e = (WorkloadType.F, local_mid, inst.aux_sid)
+                    b_e = (WorkloadType.B, local_mid, inst.aux_sid)
+                    if inst.role == ENCODER:
+                        before.setdefault(
+                            (WorkloadType.F, local_mid, anchor_sid), []
+                        ).append(f_e)
+                        after.setdefault(
+                            (WorkloadType.B, local_mid, anchor_sid), []
+                        ).append(b_e)
+                    else:
+                        # decoder F right after bb F; decoder B right before
+                        # bb B, so it runs in the backward phase (on AFAB:
+                        # AF does the Fs, AB the Bs) instead of eagerly
+                        # after its own F
+                        after.setdefault(
+                            (WorkloadType.F, local_mid, anchor_sid), []
+                        ).append(f_e)
+                        before.setdefault(
+                            (WorkloadType.B, local_mid, anchor_sid), []
+                        ).append(b_e)
+                    for w in (f_w, b_w):
+                        w.aux_static_entry = True
+                        dev.add_aux_workload(w, static_entry=True)
+                    # aux W has no downstream: it backfills idle slots
+                    # instead of taking a spliced slot on the critical chain
+                    if w_w is not None:
+                        dev.add_aux_workload(w_w)
+                else:
+                    dev.add_aux_workload(f_w)
+                    dev.add_aux_workload(b_w)
+                    if w_w is not None:
+                        dev.add_aux_workload(w_w)
+
+        # rebuild the anchored devices' entry lists with the splices in place
+        for did in set(splice_before) | set(splice_after):
+            dev = dev_by_id[did]
+            before = splice_before.get(did, {})
+            after = splice_after.get(did, {})
+            rebuilt: list[tuple] = []
+            for entry in dev.static_schedule:
+                rebuilt.extend(before.pop(entry, ()))
+                rebuilt.append(entry)
+                rebuilt.extend(after.pop(entry, ()))
+            if before or after:  # anchor entries missing from the schedule
+                raise RuntimeError(
+                    f"aux splice anchors not found in device {did}'s static "
+                    f"schedule: {list(before) + list(after)}"
+                )
+            dev.static_schedule = rebuilt
 
     def _init_dynamic_ready_queues(self) -> None:
         if self.plan.schedule != Schedule.OctoPipe:
@@ -182,6 +396,16 @@ class PipelineRuntime:
             heapq.heappush(self._event_heap, int(math.ceil(end + workload.comm_time)))
         if workload.wtype == WorkloadType.B:
             self._backward_started = True
+        if getattr(workload, "is_aux", False):
+            # encoder activations become resident at F start (throttled via
+            # aux_f_blocked); aux modules skip the backbone's admission
+            if (
+                workload.wtype == WorkloadType.F
+                and getattr(workload, "aux_role", None) == "encoder"
+            ):
+                sid = workload.sid
+                self._aux_inflight[sid] = self._aux_inflight.get(sid, 0) + 1
+            return
         if not self.max_inflight_layers or workload.wtype != WorkloadType.F:
             return
         sid = workload.sid
@@ -226,6 +450,43 @@ class PipelineRuntime:
     def has_started_backward(self) -> bool:
         return self._backward_started
 
+    def constraint_finish_eta(self, constraint: WorkloadConstraint) -> float | None:
+        """Finish time of the workload a constraint waits on, when already
+        known: the producer is currently executing (its end_time is fixed).
+        None = unknown (not started yet, or not the producer's turn)."""
+        if constraint.device_id >= len(self.devices):
+            return None
+        w = self.devices[constraint.device_id].current_workload
+        if (
+            w is not None
+            and w.state == Workload.in_progress
+            and w.mid == constraint.microbatch_id
+            and w.sid == constraint.stage_id
+            and w.wtype == constraint.workload_type
+        ):
+            return w.end_time
+        return None
+
+    def aux_f_blocked(self, workload: Workload) -> bool:
+        """Encoder-F throttle for backfilling copies: block once the copy has
+        limit activations alive.  A blocked F waits for an encoder B, which
+        follows the backbone's backward; _tune_aux_inflight only keeps caps
+        that reproduce the uncapped makespan (a too-small cap deadlocks and
+        reports stalled).  Statically spliced copies are exempt: their Fs
+        already run at the latest useful moment (right before the backbone F
+        they feed), so their in-flight peak is fixed by the schedule shape
+        and a cap could only deadlock it (e.g. AFAB legitimately keeps every
+        microbatch's encoder activation alive through the AF phase)."""
+        if self._aux_inflight_limit is None:
+            return False
+        if getattr(workload, "aux_static_entry", False):
+            return False
+        if getattr(workload, "aux_role", None) != "encoder":
+            return False
+        if workload.wtype != WorkloadType.F:
+            return False
+        return self._aux_inflight.get(workload.sid, 0) >= self._aux_inflight_limit
+
     def is_overlap_exempt(self, workload: Workload) -> bool:
         mode = self.overlap_exempt_group_by.lower().replace("+", "_").replace("-", "_")
         if mode == "mid":
@@ -247,6 +508,14 @@ class PipelineRuntime:
             if w.state == Workload.finished:
                 device.state = Device.IDLE
                 self.num_finished += 1
+                if getattr(w, "is_aux", False):
+                    device.aux_remaining -= 1
+                    # encoder B frees the microbatch's encoder activation
+                    if (
+                        w.wtype == WorkloadType.B
+                        and getattr(w, "aux_role", None) == "encoder"
+                    ):
+                        self._aux_inflight[w.sid] = self._aux_inflight.get(w.sid, 1) - 1
                 self._on_activation_consumer_finished(w)
                 self._propagate_constraints(w, time)
                 device.current_workload = None
@@ -264,6 +533,23 @@ class PipelineRuntime:
                     and len(w.constraints) == 0
                 ):
                     device.executable_workloads.push(w)
+        if self._release_index:
+            cstr = WorkloadConstraint(
+                completed.did, completed.mid, completed.sid, completed.wtype
+            )
+            waiters = self._release_index.get(cstr)
+            if waiters:
+                for device, w in waiters:
+                    w.update_constraints(time, cstr)
+                    if w.state != Workload.not_started or w.constraints:
+                        continue
+                    if getattr(w, "is_aux", False):
+                        # statically spliced aux entries run at their slot in
+                        # static_schedule; only backfilling copies queue here
+                        if not getattr(w, "aux_static_entry", False):
+                            device.push_aux_ready(w)
+                    elif device.schedule_method == Schedule.OctoPipe:
+                        device.executable_workloads.push(w)
 
     def execute_workload(self, time: float) -> None:
         for device in self.devices:
@@ -325,16 +611,19 @@ class PipelineRuntime:
         records = []
         for device in self.devices:
             for w in device.workload_execute_record:
-                records.append(
-                    {
-                        "did": w.did,
-                        "mid": w.mid,
-                        "sid": w.sid,
-                        "wtype": w.wtype.name,
-                        "start": w.start_time,
-                        "end": w.end_time,
-                        "duration": w.duration,
-                    }
-                )
+                rec = {
+                    "did": w.did,
+                    "mid": w.mid,
+                    "sid": w.sid,
+                    "wtype": w.wtype.name,
+                    "start": w.start_time,
+                    "end": w.end_time,
+                    "duration": w.duration,
+                }
+                aux_name = getattr(w, "aux_name", None)
+                if aux_name is not None:
+                    rec["aux"] = aux_name
+                    rec["role"] = getattr(w, "aux_role", "")
+                records.append(rec)
         makespan = max((r["end"] or 0 for r in records), default=0)
         return {"makespan": makespan, "records": records, "time": self.time}
