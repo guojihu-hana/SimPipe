@@ -1603,6 +1603,20 @@ function syncTuningLock() {
     setLocked(ep, !moe,
       "Only MoE models use expert parallelism.", fieldDesc("parallel.ep_size"));
   }
+
+  // pipelines fix ZeRO at stage 1: higher stages shard grads/params across
+  // DP, which does not compose with PP's per-stage grad accumulation here
+  const zs = document.querySelector('[data-path="parallel.zero_stage"]');
+  if (zs) {
+    const pp = (getPath(cfgObj, "parallel.pp_size") || 1) > 1;
+    if (pp && getPath(cfgObj, "parallel.zero_stage") !== 1) {
+      setPath(cfgObj, "parallel.zero_stage", 1);
+      zs.value = "1";
+      scheduleDump();
+    }
+    setLocked(zs, pp, "Locked: ZeRO is fixed at stage 1 while PP > 1.",
+      fieldDesc("parallel.zero_stage"));
+  }
 }
 
 /* Batch rule: any batch content requires exactly one of microbatches /
