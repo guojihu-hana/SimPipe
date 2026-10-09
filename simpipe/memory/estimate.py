@@ -184,7 +184,7 @@ def estimate_pipeline_memory(
 
     aux_plan = getattr(plan, "aux_plan", None)
     if aux_plan is not None:
-        devices = _apply_aux_memory(devices, aux_plan, hbm_bytes, records)
+        devices = _apply_aux_memory(devices, aux_plan, hbm_bytes, records, plan)
 
     return PipelineMemoryEstimate(
         per_device=tuple(devices),
@@ -195,12 +195,16 @@ def estimate_pipeline_memory(
     )
 
 
-def aux_inflight_peaks(records: list[dict] | None) -> dict[int, int]:
-    """Peak resident microbatches per aux instance (keyed by aux stage id).
+def aux_inflight_peaks(
+    records: list[dict] | None, plan: WorkloadPlan | None = None
+) -> dict[int, float]:
+    """Peak resident microbatch weight per aux instance (keyed by aux sid).
 
     A microbatch's aux activation lives from its F start until its B end;
-    the peak is the max number of simultaneously alive intervals under the
-    simulated schedule (sweep over sorted interval endpoints).
+    the peak is the max total weight of simultaneously alive intervals under
+    the simulated schedule (sweep over sorted interval endpoints).  With a
+    variable batch each microbatch weighs its token ratio (act_gb describes
+    the reference shape); uniform batches weigh 1 per microbatch.
     """
     if not records:
         return {}
@@ -217,16 +221,17 @@ def aux_inflight_peaks(records: list[dict] | None) -> dict[int, int]:
             span[0] = float(r.get("start") or 0.0)
         else:
             span[1] = float(r.get("end") or 0.0)
-    peaks: dict[int, int] = {}
+    peaks: dict[int, float] = {}
     for sid, by_mid in intervals.items():
         events = []
-        for start, end in by_mid.values():
+        for mid, (start, end) in by_mid.items():
             if start is None:
                 continue
-            events.append((start, 1))
-            events.append((end if end is not None else float("inf"), -1))
+            weight = plan.token_ratio_for_mid(mid) if plan is not None else 1.0
+            events.append((start, weight))
+            events.append((end if end is not None else float("inf"), -weight))
         events.sort(key=lambda e: (e[0], e[1]))  # frees before allocs at ties
-        cur = peak = 0
+        cur = peak = 0.0
         for _, delta in events:
             cur += delta
             peak = max(peak, cur)
@@ -239,6 +244,7 @@ def _apply_aux_memory(
     aux_plan,
     hbm_bytes: int,
     records: list[dict] | None = None,
+    plan: WorkloadPlan | None = None,
 ) -> list[DeviceMemoryEstimate]:
     """Fold encoder/decoder memory into the per-device estimates.
 
@@ -246,12 +252,13 @@ def _apply_aux_memory(
     the standard Adam state (grad 1x, fp32 master 2x, fp32 moments 4x of the
     parameter bytes, matching the backbone's mixed-precision layout), and
     act_gb per resident microbatch at the schedule's peak (aux_inflight_peaks
-    over the run records).  Replicated copies pay this on every device;
-    dedicated copies add a fresh device row after the backbone's.
+    over the run records; variable batches weigh each microbatch by its token
+    ratio).  Replicated copies pay this on every device; dedicated copies add
+    a fresh device row after the backbone's.
     """
     from dataclasses import replace as _replace
 
-    act_peaks = aux_inflight_peaks(records)
+    act_peaks = aux_inflight_peaks(records, plan)
     extra: dict[int, dict[str, int]] = {}
     labels: dict[int, list[str]] = {}
     for inst in aux_plan.instances:

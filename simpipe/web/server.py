@@ -74,6 +74,8 @@ def run_simulation(yaml_text: str) -> dict:
                 f"-> {bo.makespan:.0f}, {bo.trials} sims; slot k runs input microbatch order[k])"
             )
 
+    batch_derived = _batch_derived(cfg, executor)
+
     result = executor.run()
     # dp replicas duplicate every block on the same device rows with mids
     # offset by dp_idx * nmb; show/export/analyze the first replica only.
@@ -116,6 +118,51 @@ def run_simulation(yaml_text: str) -> dict:
         "gantt": _gantt_data(records),
         "svg": svg,
         "pipeline_config": pipeline_config,
+        "batch_derived": batch_derived,
+    }
+
+
+def _batch_derived(cfg, executor) -> list[dict] | None:
+    """Per-microbatch compute-time ratios derived from sequence lengths.
+
+    Only for batch.microbatches mode: the engine's own scaling model gives
+    each microbatch a (linear, quadratic) scale pair vs the profiled shape
+    (model.micro_batch_size x model.seq_len); folding those over the summed
+    stage timings (attention seconds scale with quad, the rest with lin)
+    yields one whole-model time multiplier the UI can show next to the seqs.
+    Encoder/decoder modules run each microbatch exactly once too and scale
+    linearly with its tokens, so their per-microbatch time joins the linear
+    term.
+    """
+    batch = cfg.batch
+    if batch is None or not batch.microbatches:
+        return None
+    scales = batch.scales(cfg.model.micro_batch_size, cfg.model.seq_len)
+    timings = executor.plan.stage_timings
+    total = sum(t.f_time + t.b_time + t.w_time for t in timings)
+    quad_part = sum(t.f_quad + t.b_quad for t in timings)
+    aux_total = sum(
+        m.f_ticks + m.b_ticks + m.w_ticks for m in (cfg.encoders + cfg.decoders)
+    )
+    whole = total + aux_total
+    lin_share = (total - quad_part + aux_total) / whole if whole > 0 else 1.0
+    quad_share = quad_part / whole if whole > 0 else 0.0
+    items = []
+    for (lin, quad), seqs in zip(scales, batch.microbatches):
+        items.append(
+            {
+                "time_ratio": round(lin_share * lin + quad_share * quad, 4),
+                "lin": round(lin, 4),
+                "quad": round(quad, 4),
+                "tokens": int(sum(seqs)),
+            }
+        )
+    # lin/quad shares let the client recompute ratios instantly while
+    # editing (same formula), without waiting for the next debounced run
+    return {
+        "lin_share": round(lin_share, 6),
+        "quad_share": round(quad_share, 6),
+        "items": items,
     }
 
 

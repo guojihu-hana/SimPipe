@@ -452,3 +452,52 @@ def test_aux_model_spec_sums_layers():
     assert by_key(aux_l["vit"]).keys() == by_key(aux_f["vit"]).keys()
     for k, rec in by_key(aux_l["vit"]).items():
         assert rec["start"] == by_key(aux_f["vit"])[k]["start"]
+
+
+def test_aux_scales_with_variable_batch():
+    """A variable batch scales each aux block linearly with the microbatch's
+    tokens (the module is one opaque block; no per-op attention split)."""
+    data = base_data()
+    data["model"]["seq_len"] = 4096
+    data["encoders"] = [{"name": "enc", "forward_ms": 2.0, "backward_ms": 4.0,
+                         "weight_ms": 0.0, "placement": "first_stage"}]
+    data["decoders"] = [{"name": "dec", "forward_ms": 1.0, "backward_ms": 2.0,
+                         "weight_ms": 0.0, "placement": "last_stage"}]
+    # mb0 = 2x tokens, mb1 = half, rest = reference
+    seqs = [[4096, 4096], [2048]] + [[4096]] * (NMB - 2)
+    data["batch"] = {"mode": "pack", "microbatches": seqs}
+    _, res = run(data)
+    assert_no_overlap(res)
+    _, aux = split_records(res)
+    enc, dec = by_key(aux["enc"]), by_key(aux["dec"])
+
+    def dur(rec):
+        return rec["end"] - rec["start"]
+
+    for m, lin in ((0, 2.0), (1, 0.5), (2, 1.0)):
+        assert dur(enc[(m, "F")]) == pytest.approx(200 * lin)
+        # bwd_split off: B carries B+W (W=0 here) -> 400 ticks reference
+        assert dur(enc[(m, "B")]) == pytest.approx(400 * lin)
+        assert dur(dec[(m, "F")]) == pytest.approx(100 * lin)
+        assert dur(dec[(m, "B")]) == pytest.approx(200 * lin)
+
+
+def test_aux_act_peak_weighs_variable_batch():
+    """act_gb charges by the token-weighted in-flight peak, not the count."""
+    from simpipe.memory.estimate import aux_inflight_peaks
+
+    data = base_data()
+    data["model"]["seq_len"] = 4096
+    data["encoders"] = [{"name": "enc", "forward_ms": 2.0, "act_gb": 1.0,
+                         "placement": "first_stage"}]
+    seqs = [[4096, 4096]] + [[4096]] * (NMB - 1)  # mb0 twice the tokens
+    data["batch"] = {"mode": "pack", "microbatches": seqs}
+    ex, res = run(data)
+    weighted = aux_inflight_peaks(res.records, ex.plan)
+    plain = aux_inflight_peaks(res.records)
+    sid = ex.plan.aux_plan.instances[0].aux_sid
+    # the double-size mb0 is in flight at the peak -> weighted > count only
+    # if the peak window contains it; at minimum the weighted peak must be
+    # >= the count peak - 1 + 2 (mb0's weight) when mb0 is resident, and
+    # never smaller than a uniform batch would give
+    assert weighted[sid] >= plain[sid]

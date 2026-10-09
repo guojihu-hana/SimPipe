@@ -245,6 +245,8 @@ decoders:
 - `dedicated` — its own extra device appended after the backbone's, connected via P2P; it shows up as an extra row in the Gantt chart and memory summary.
 - `[0, 2]` — explicit device-id list: same round-robin microbatch sharding as `replicated`, restricted to the listed devices.
 
+With a variable batch (`batch.microbatches` / `batch.time_scales`), each module's F/B/W blocks scale linearly with the microbatch's token ratio — the module runs as one opaque block, so the attention-quadratic split only applies inside the backbone's stage timings. The activation charge weighs each resident microbatch the same way.
+
 Encoder activations (`act_gb` per microbatch) live from the module's F until its B completes, which follows the backbone's backward — so an encoder that runs all its forwards upfront holds every microbatch's activation at once. The in-flight throttle only concerns backfilling copies (dedicated devices, off-anchor shards, OctoPipe): `tuning.aux_memory_opt` (default on) searches the smallest per-copy in-flight cap that keeps the makespan unchanged and throttles encoder forwards to it, cutting the activation peak at zero bubble cost (e.g. 16 -> 9 resident microbatches in the example above). `tuning.aux_inflight_limit` overrides the cap explicitly; too-small caps deadlock the static order and the run reports `stalled`. Spliced copies are exempt and skip the search entirely: their forwards already run at the latest useful moment, so their peak is fixed by the schedule shape (1F1B holds about one activation per stage; AFAB legitimately holds all of them through the AF phase). Decoders need no throttle: their F -> B window is naturally short. The memory summary charges `act_gb x peak` to each copy's device.
 
 ### Memory Estimation

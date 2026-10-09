@@ -94,6 +94,7 @@ class PipelineRuntime:
             aux_plan.encoder_inflight_limit if aux_plan is not None else None
         )
         self._init_devices()
+        self._init_interleaved_comm_gates()
         self._init_aux()
         self._init_dynamic_ready_queues()
         self.num_finished = 0
@@ -128,10 +129,14 @@ class PipelineRuntime:
 
     def _init_devices(self) -> None:
         placement = self.plan.placement.device_stages
-        # Profiled timings are in 0.01 ms ticks; the empirical overheads below
-        # are given in ms and converted here.
+        # Profiled timings are in 0.01 ms (= 10 us) ticks; the empirical
+        # overheads below are given in ms / us and converted to ticks here.
+        # comm_time delays every cross-device dependency edge; with a whole
+        # simulation tick clock any fractional arrival rounds up, so e.g. the
+        # default 5 us alpha shows up as one full tick between an F's end and
+        # the next stage's F start.  Set both to 0 for back-to-back edges.
         overhead = self.hardware.workload_overhead_ms * 100.0
-        comm_time = self.hardware.comm_alpha_us / 1000.0 + self.hardware.p2p_latency_ms * 100.0
+        comm_time = self.hardware.comm_alpha_us / 10.0 + self.hardware.p2p_latency_ms * 100.0
         self._comm_time = comm_time
         self._workload_overhead = overhead
         for did in range(self.device_num):
@@ -156,6 +161,74 @@ class PipelineRuntime:
             for device in self.devices
             for sid, stage in device.stages.items()
         }
+
+    def _init_interleaved_comm_gates(self) -> None:
+        """Model interleaved 1F1B's coupled steady-state communication.
+
+        Megatron's interleaved schedule exchanges activations with batched
+        send-recv calls: after each steady-state (F, B) compute pair the rank
+        posts one p2p that sends both results and receives the next F's input
+        together with the next B's gradient.  A steady F therefore cannot
+        start before the gradient consumed by its step-partner B exists
+        downstream -- adjacent ranks stay staggered by one full (F, B) step.
+        Plain per-op ASAP timing instead lets the F float early (its input
+        arrived long ago) and packs each B head-to-tail after the downstream
+        B, which is not how the synchronous schedule behaves on hardware.
+
+        Encode the coupling as an extra dependency: every post-warmup F also
+        waits for the downstream-gradient producers of the B that immediately
+        follows it in the device's schedule.  Warmup Fs (no B partner before
+        them) and drain Bs (no F left to pair) keep plain dependencies, and
+        a last-stage B contributes nothing (its "gradient" is its own F, a
+        same-device edge).  Releases go through _release_index because the
+        stage-adjacency propagation only walks sid +/- 1 of the completed
+        workload, which does not reach the F's stage when the paired B
+        belongs to a different chunk.
+        """
+        if self.plan.schedule != Schedule.INTERLEAVED or not self.plan.static_schedule:
+            return
+        for did, row in enumerate(self.plan.static_schedule):
+            if did >= len(self.devices):
+                break
+            device = self.devices[did]
+            # The generator's warmup count (InterleavedStrategy.generate).
+            # When micro_batch_num is small every F fits in the warmup quota
+            # and the device has no steady phase at all: its Fs then all run
+            # up front and its Bs drain afterwards.  Pairing the last such F
+            # with the first drain B would gate an *earlier* list entry on a
+            # *later* neighbour step and deadlock the fill (each rank's last
+            # warmup F waiting on the next rank's first B, which sits behind
+            # that rank's own gated F).  Only steady-phase Fs are paired.
+            chunk_num = len(self.plan.placement.device_stages[did])
+            warmup = (chunk_num - 1) * self.device_num + (
+                self.device_num - did - 1
+            ) * 2
+            f_seen = 0
+            pending_f: Workload | None = None
+            for wtype, local_mid, sid in row:
+                stage = device.stages.get(sid)
+                if stage is None:
+                    continue
+                mid = local_mid + self.mid_offset
+                if wtype == WorkloadType.F:
+                    # overwrite: only the F directly preceding a B is its
+                    # step partner; warmup Fs stay ungated
+                    f_seen += 1
+                    pending_f = (
+                        stage.get_workload(mid, WorkloadType.F)
+                        if f_seen > warmup
+                        else None
+                    )
+                elif wtype == WorkloadType.B:
+                    b_w = stage.get_workload(mid, WorkloadType.B)
+                    if pending_f is not None and b_w is not None:
+                        for cstr in b_w.constraints:
+                            if cstr.stage_id == b_w.sid + 1:
+                                pending_f.constraints.add(cstr)
+                                self._release_index.setdefault(cstr, []).append(
+                                    (device, pending_f)
+                                )
+                    pending_f = None
 
     def _init_aux(self) -> None:
         """Materialize encoder/decoder workloads and wire their dependencies.
@@ -253,9 +326,14 @@ class PipelineRuntime:
                     w.aux_role = inst.role
                     return w
 
-                f_w = make(WorkloadType.F, inst.f_ticks)
-                b_w = make(WorkloadType.B, b_ticks)
-                w_w = make(WorkloadType.W, w_ticks) if w_ticks > 0 else None
+                # Variable batches scale aux blocks with the microbatch's
+                # token count (linear): the module runs as one opaque block,
+                # so no per-op attention split applies (that quadratic term
+                # only exists inside the backbone's stage timings).
+                lin = self.plan.token_ratio_for_mid(mid)
+                f_w = make(WorkloadType.F, inst.f_ticks * lin)
+                b_w = make(WorkloadType.B, b_ticks * lin)
+                w_w = make(WorkloadType.W, w_ticks * lin) if w_ticks > 0 else None
                 f_done = WorkloadConstraint(inst.device_id, mid, inst.aux_sid, WorkloadType.F)
                 b_done = WorkloadConstraint(inst.device_id, mid, inst.aux_sid, WorkloadType.B)
 

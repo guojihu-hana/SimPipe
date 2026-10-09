@@ -247,7 +247,39 @@
      .wide rows (lists, paths) always span the full width */
   .fgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(235px, 1fr)); column-gap: 14px; }
   .frow { display: grid; grid-template-columns: 108px 1fr; gap: 7px; align-items: center; padding: 2px 0; min-width: 0; }
+  /* compact sections (Parallel): 4-up cells, label and input on one line;
+     fixed per-column label widths keep the inputs vertically aligned */
+  .form-sec.compact .fgrid {
+    grid-template-columns: repeat(4, minmax(0, 1fr)); column-gap: 10px; row-gap: 3px;
+  }
+  .form-sec.compact .frow {
+    grid-template-columns: 50px minmax(0, 1fr); gap: 5px; align-items: center;
+  }
+  .form-sec.compact .frow:nth-child(4n+2) { grid-template-columns: 62px minmax(0, 1fr); }
+  .form-sec.compact .frow:nth-child(4n+3) { grid-template-columns: 62px minmax(0, 1fr); }
+  .form-sec.compact .frow:nth-child(4n)   { grid-template-columns: 92px minmax(0, 1fr); }
+  .form-sec.compact .frow label { font-size: 10.5px; }
+  .form-sec.compact .frow input[type="number"] { max-width: none; min-width: 0; }
+  .form-sec.compact .frow input[type="checkbox"] { margin: 0; }
   .frow.wide { grid-column: 1 / -1; }
+  /* Model section: 3-up grid — row 1 Name | #Layers | Multimodal,
+     row 2 Pattern (two cells) | Align model; labels size to content.
+     The #Layers column stays narrow so the +Encoder/+Decoder pair fits */
+  .fgrid.model-grid {
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, .55fr) minmax(0, 1.35fr);
+    column-gap: 10px;
+  }
+  .fgrid.model-grid .aux-add-btns button { white-space: nowrap; }
+  .fgrid.model-grid .frow { grid-template-columns: auto minmax(0, 1fr); gap: 5px; }
+  .fgrid.model-grid .frow label { font-size: 10.5px; }
+  .fgrid.model-grid .frow input[type="number"] { max-width: none; }
+  .fgrid.model-grid .frow.pattern-row { grid-column: span 2; }
+  /* equal label widths per column: Name aligns with Pattern (col 1),
+     Multimodal with Align model (col 3, select fills to the right edge) */
+  .fgrid.model-grid .frow.name-row,
+  .fgrid.model-grid .frow.pattern-row { grid-template-columns: 46px minmax(0, 1fr); }
+  .fgrid.model-grid .frow.aux-add-row,
+  .fgrid.model-grid #align-row { grid-template-columns: 64px minmax(0, 1fr); }
   .frow label { font-size: 11.5px; color: #46536a; cursor: help; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .frow input[type="text"], .frow input[type="number"], .frow select, .frow textarea {
     width: 100%; min-width: 0; padding: 3.5px 8px; border: 1px solid var(--border); border-radius: 8px;
@@ -271,6 +303,65 @@
     color: #b45309; background: #fff8ec; border: 1px solid #fbd9a5;
     border-radius: 8px; padding: 6px 11px;
   }
+
+  /* ---------- variable-batch microbatch editor ---------- */
+  #batch-mbs { margin-top: 8px; }
+  .bmb-head { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; }
+  .bmb-fold {
+    border: 0; background: none; cursor: pointer; padding: 0 2px;
+    font-size: 12px; color: #64748b; line-height: 1;
+  }
+  .bmb-title { font-size: 11px; font-weight: 700; color: #8593a8;
+    text-transform: uppercase; letter-spacing: .4px; }
+  .bmb-rand { margin-left: auto; display: inline-flex; align-items: center; gap: 3px; }
+  .bmb-rand input {
+    width: 46px; box-sizing: border-box; padding: 2.5px 5px;
+    border: 1px solid var(--border); border-radius: 6px; background: #fff;
+    color: var(--text); font: 10.5px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .bmb-rand input:focus { outline: none; border-color: var(--accent); }
+  .bmb-rand-dash { color: #97a3b6; font-size: 10px; }
+  .bmb-rand-btn {
+    border: 1px solid var(--border); background: #f7f9fc; color: #46536a;
+    font-size: 11px; font-weight: 600; padding: 2.5px 9px; border-radius: 7px; cursor: pointer;
+  }
+  .bmb-rand-btn:hover { background: #eef2f9; }
+  .bmb-modes { display: inline-flex; border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden; }
+  .bmb-mode {
+    border: 0; background: #f7f9fc; color: #64748b; font-size: 11px; font-weight: 600;
+    padding: 3.5px 10px; cursor: pointer;
+  }
+  .bmb-mode + .bmb-mode { border-left: 1px solid var(--border); }
+  .bmb-mode.on { background: var(--accent); color: #fff; cursor: default; }
+  .bmb-grid {
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 6px 8px; max-height: 300px; overflow-y: auto;
+  }
+  .bmb-cell {
+    display: grid; grid-template-columns: auto 1fr; gap: 2px 5px; align-items: center;
+    padding: 4px 5px; border: 1px solid #eef1f6; border-radius: 8px; background: #fbfcfe;
+  }
+  .bmb-idx { font-size: 10.5px; color: #8593a8; font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .bmb-cell .bmb-seqs { grid-column: 1 / -1; }
+  .bmb-cell input {
+    width: 100%; box-sizing: border-box; padding: 2.5px 6px;
+    border: 1px solid var(--border); border-radius: 6px; background: #fff;
+    color: var(--text); font: 10.5px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .bmb-cell input:focus { outline: none; border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, .12); }
+  .bmb-cell input:disabled {
+    background: #eef1f6; color: #9aa7bd; border-color: #e0e6ef; cursor: not-allowed;
+  }
+  .bmb-cell .bmb-time:disabled {
+    background: none; border-color: transparent; color: #64748b; cursor: default;
+    padding-left: 0; font-weight: 600;
+  }
+  .bmb-cell input.invalid { border-color: var(--bad);
+    box-shadow: 0 0 0 3px rgba(220, 38, 38, .12); }
 
   /* ---------- partition / placement visual editor ---------- */
   #partplace-body { padding: 10px 13px; overflow: auto; }
@@ -409,12 +500,6 @@
   .mt-row input[type="number"] {
     width: 100%; padding: 2px 4px; font-size: 11px; border-radius: 6px;
     border: 1px solid #d5dcea; background: #fff; color: #2c3a52; min-width: 0;
-  }
-  .mt-row.mt-align { background: none; }
-  .mt-align-box { grid-column: 4 / -1; }
-  .mt-align-box select {
-    width: 100%; padding: 2px 4px; font-size: 11px; border-radius: 6px;
-    border: 1px solid #d5dcea; background: #fff; color: #2c3a52;
   }
   .pp-empty-hint { font-size: 10px; color: #a8b3c5; padding: 3px 2px; }
   .pp-arrays {

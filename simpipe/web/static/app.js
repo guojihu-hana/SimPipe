@@ -202,9 +202,9 @@ const CFG_SCHEMA = [
       desc: "Simulation tick budget in 0.01 ms units; the run reports STALLED when exceeded." },
   ]},
   { sec: "Model", fields: [
-    { path: "model.name", type: "dselect", optsKey: "models", def: "mock_model", noEmpty: true,
+    { path: "model.name", type: "dselect", optsKey: "models", def: "mock_model", noEmpty: true, label: "Config",
       desc: "Profiled model (has profiles/<name>.json) or mock_model for synthetic timings. Custom names (used with profile_times_path) can be set in the YAML view." },
-    { path: "model.num_layers", type: "int", def: 32, min: 1, max: 4096,
+    { path: "model.num_layers", type: "int", def: 32, min: 1, max: 4096, label: "#Layers",
       desc: "Transformer body layer count (embedding/head excluded)." },
     { path: "model.pattern", type: "text", ph: "ET*32L",
       desc: "Layer pattern: E embedding, L head, body types M mamba / * attn / - MLP / T transformer / # MoE; X*N repeats X N times. Editable for mock_model (num_layers follows the pattern; raising num_layers pads T). Profiled models show their pattern read-only. Hover to see the full pattern." },
@@ -217,39 +217,35 @@ const CFG_SCHEMA = [
     { path: "model.layer_w_time", type: "float", min: 0.01, max: 1e9, mockOnly: true,
       desc: "Mock timing: weight-update duration override; defaults to the forward time." },
   ]},
-  { sec: "Parallel", fields: [
+  // compact 4-up grid; row 1 and row 2 pair up column-wise
+  // (PP/EP, TP/DP, Zero/Seq len, mb size / #mbs) with per-column label widths
+  { sec: "Parallel", compact: true, fields: [
     { path: "parallel.pp_size", type: "int", def: 1, min: 1, max: 1024,
       desc: "Pipeline-parallel size = number of devices." },
     { path: "parallel.tp_size", type: "int", def: 8, min: 1, max: 64,
       desc: "Tensor-parallel size; scales analytic timing and per-rank model/activation memory." },
+    { path: "parallel.zero_stage", type: "int", def: 1, min: 0, max: 3,
+      desc: "ZeRO stage (0-3) used by the per-rank model-state memory estimate." },
+    { path: "model.micro_batch_size", type: "int", def: 1, min: 1, max: 65536, label: "Micro-batch size",
+      desc: "Reference microbatch size of the profiled shape." },
     { path: "parallel.ep_size", type: "int", def: 1, min: 1, max: 512,
       desc: "Expert-parallel size for MoE models; shards experts across ranks." },
     { path: "parallel.dp_size", type: "int", def: 1, min: 1, max: 4096,
       desc: "Data-parallel size; with ZeRO it shards optimizer/gradient state in the memory estimate." },
-    { path: "parallel.zero_stage", type: "int", def: 1, min: 0, max: 3,
-      desc: "ZeRO stage (0-3) used by the per-rank model-state memory estimate." },
     { path: "model.seq_len", type: "int", def: 4096, min: 1, max: 16777216,
       desc: "Reference sequence length of the profiled shape; varlen batch scales relative to it." },
-    { path: "parallel.micro_batch_num", type: "int", def: 8, min: 1, max: 16384,
+    { path: "parallel.micro_batch_num", type: "int", def: 8, min: 1, max: 16384, label: "#Micro-batches",
       desc: "Microbatches per iteration. Derived from batch.microbatches / batch.time_scales when those are set." },
-    { path: "model.micro_batch_size", type: "int", def: 1, min: 1, max: 65536,
-      desc: "Reference microbatch size of the profiled shape." },
     { path: "parallel.bwd_split", type: "bool", desc: "Split backward into B (grad-input) and W (grad-weight) workloads (zero-bubble style)." },
     { path: "model.recompute", type: "bool", desc: "Full activation recompute: each backward re-runs the forward first." },
-    { path: "parallel.chunk_num", type: "int", min: 1, max: 256, ph: "auto",
+    { path: "parallel.chunk_num", type: "int", min: 1, max: 256, ph: "auto", label: "#Chunk",
       desc: "Virtual-pipeline chunks per device; empty = auto (interleaved: max, else 1)." },
   ]},
   { sec: "Batch: Variable-length microbatches", id: "batch", fields: [
     { path: "batch.mode", type: "select", options: ["", "pack", "pad"], emptyLabel: "Off",
-      desc: "pack: concat sequences, varlen kernels (linear ~ sum(len), attention ~ sum(len^2)); pad: pad to the longest sequence (linear ~ n*max, attention ~ n*max^2). Requires exactly one of microbatches / time_scales below." },
-    { path: "batch.microbatches", type: "lines", wide: true, itemMin: 1, itemMax: 16777216,
-      ph: "4096\n2048, 2048\n...  (one microbatch per line; line count = micro_batch_num)",
-      desc: "Sequence lengths per microbatch, one microbatch per line. The line count must equal parallel.micro_batch_num (or leave micro_batch_num empty to derive it)." },
-    { path: "batch.time_scales", type: "floatlist", wide: true, itemMin: 1e-6, itemMax: 1e9,
-      ph: "1, 1.2, 1.8, ...  (count = micro_batch_num)",
-      desc: "Direct per-microbatch compute multipliers. Count must equal parallel.micro_batch_num. With time_ref the values are absolute times. Mutually exclusive with microbatches." },
+      desc: "pack: concat sequences, varlen kernels (linear ~ sum(len), attention ~ sum(len^2)); pad: pad to the longest sequence (linear ~ n*max, attention ~ n*max^2). Turning it on lists one editable row per microbatch below." },
     { path: "batch.time_ref", type: "float", def: 1.0, min: 1e-6, max: 1e12,
-      desc: "Reference for absolute time_scales: scale = value / time_ref." },
+      desc: "Reference for absolute times in 'By time' mode: scale = value / time_ref (1.0 = values are already multipliers)." },
   ]},
   { sec: "Tuning", fields: [
     { path: "tuning.auto_tune", type: "bool", def: false,
@@ -269,7 +265,11 @@ const CFG_SCHEMA = [
     { path: "hardware.intra_node_bw_gbps", type: "float", def: 600.0, min: 0.1, max: 100000,
       desc: "Intra-node bandwidth in GB/s for communication estimates." },
     { path: "hardware.workload_overhead_ms", type: "float", def: 0.0, min: 0, max: 1000,
-      desc: "Constant launch overhead in ms added to every F/B/W workload (dispatch, bookkeeping, chunk switch)." },
+      label: "Comp launch (ms)",
+      desc: "Constant launch overhead in ms added to every F/B/W workload's duration (kernel dispatch, bookkeeping, chunk switch); occupies device time." },
+    { path: "hardware.comm_alpha_us", type: "float", def: 5.0, min: 0, max: 100000,
+      label: "Comm launch (us)",
+      desc: "Per-message launch latency in us on every cross-device dependency edge (NCCL alpha); delays the consumer without occupying device time. Any nonzero value rounds up to a whole 0.01 ms tick; set 0 for back-to-back stage handoffs." },
     { path: "hardware.p2p_latency_ms", type: "float", def: 0.0, min: 0, max: 10000,
       desc: "Extra latency in ms on every cross-device dependency edge (P2P transfer)." },
     { path: "hardware.comp_power", type: "float", def: 1.0, min: 0.01, max: 1000,
@@ -430,7 +430,8 @@ function buildForm() {
   const root = $("config-form");
   for (const sec of CFG_SCHEMA) {
     const box = document.createElement("div");
-    box.className = "form-sec";
+    // compact: 4-up cells with the label above the input (short numerics)
+    box.className = sec.compact ? "form-sec compact" : "form-sec";
     box.innerHTML = `<h4>${sec.sec}</h4>`;
     const fgrid = document.createElement("div");
     fgrid.className = "fgrid";
@@ -439,7 +440,7 @@ function buildForm() {
       row.className = f.wide ? "frow wide" : "frow";
       if (f.mockOnly) row.dataset.mockonly = "1"; // hidden unless mock_model
       row.title = f.desc; // hover shows the comment
-      const name = labelize(f.path.split(".").pop());
+      const name = f.label || labelize(f.path.split(".").pop());
       const ph = f.ph !== undefined ? f.ph : (f.def !== undefined ? String(f.def) : "");
       const phAttr = ph ? ` placeholder="${String(ph).replace(/"/g, "&quot;")}"` : "";
       let ctl;
@@ -464,8 +465,9 @@ function buildForm() {
     }
     box.appendChild(fgrid);
     if (sec.sec === "Model") {
-      // + Encoder / + Decoder live in the grid cell next to the (shortened)
-      // pattern box; the pattern's full text shows on hover
+      // 3-up grid: row 1 = Name | #Layers | Multimodal (+Enc/+Dec buttons),
+      // row 2 = Pattern (two cells, hover shows full text) | Align model
+      fgrid.classList.add("model-grid");
       const addRow = document.createElement("div");
       addRow.className = "frow aux-add-row";
       addRow.innerHTML =
@@ -473,9 +475,25 @@ function buildForm() {
         `<button type="button" class="small" id="add-encoder" title="Add a multimodal encoder: every microbatch runs all encoders before backbone stage 0.">+ Encoder</button>` +
         `<button type="button" class="small" id="add-decoder" title="Add a decoder behind the last stage: its F follows the last stage's F and its B gates the last stage's B.">+ Decoder</button></span>`;
       const patRow = fgrid.querySelector('[data-path="model.pattern"]').closest(".frow");
-      patRow.after(addRow);
+      patRow.classList.add("pattern-row");
+      // fixed label widths (CSS) align the input edges column-wise:
+      // Name with Pattern, Multimodal with Align model
+      fgrid.querySelector('[data-path="model.name"]').closest(".frow")
+        .classList.add("name-row");
+      patRow.before(addRow);
       addRow.querySelector("#add-encoder").addEventListener("click", () => addAuxModule("encoders"));
       addRow.querySelector("#add-decoder").addEventListener("click", () => addAuxModule("decoders"));
+      // Align model: mock only (renderModelTimes toggles it and fills options)
+      const alignRow = document.createElement("div");
+      alignRow.className = "frow";
+      alignRow.id = "align-row";
+      alignRow.innerHTML =
+        `<label title="Copy the selected model's pattern, per-type times and model config into this mock; every value stays editable.">Align model</label>` +
+        `<select id="mt-align"><option value="">--</option></select>`;
+      patRow.after(alignRow);
+      alignRow.querySelector("#mt-align").addEventListener("change", (ev) => {
+        if (ev.target.value) alignMockToModel(ev.target.value);
+      });
 
       const mt = document.createElement("div");
       mt.id = "model-times"; // per-layer-type f/b/w table, filled dynamically
@@ -485,6 +503,9 @@ function buildForm() {
       box.appendChild(aux);
     }
     if (sec.id === "batch") {
+      const mbs = document.createElement("div");
+      mbs.id = "batch-mbs"; // per-microbatch rows (time | seqs), filled dynamically
+      box.appendChild(mbs);
       const warn = document.createElement("div");
       warn.className = "form-warn";
       warn.id = "batch-warn";
@@ -564,6 +585,22 @@ function onFormEdit(ev, fields) {
         if (dpEl) dpEl.value = String(ep);
       }
     }
+    if (f.path === "batch.mode") {
+      if (val === undefined) {
+        // Off: drop the whole batch block (a bare mode would fail the
+        // engine's "exactly one of microbatches/time_scales" rule) but
+        // stash the rows so switching back restores them
+        const b = cfgObj.batch || {};
+        if (Array.isArray(b.microbatches)) batchStash.seqs = b.microbatches.map(s => [...s]);
+        if (Array.isArray(b.time_scales)) batchStash.times = [...b.time_scales];
+        delete cfgObj.batch;
+      } else if (!batchUseTime() && !Array.isArray((cfgObj.batch || {}).microbatches)) {
+        cfgObj.batch.microbatches = []; // fresh enable: start in "By seqs"
+      }
+      renderBatchMbs();
+    }
+    if (f.path === "parallel.micro_batch_num" || f.path === "model.seq_len")
+      renderBatchMbs(); // row count / default seq length follow these
     scheduleDump();
     scheduleAutoRun();
   } catch (err) {
@@ -588,6 +625,7 @@ function refreshFormValues() {
   renderPartPlace();
   renderModelTimes();
   renderAuxModules();
+  renderBatchMbs();
 }
 
 /* ============ multimodal encoders / decoders ============
@@ -619,6 +657,11 @@ const AUX_FIELD_DESC = {
 function auxList(role) {
   return Array.isArray(cfgObj[role]) ? cfgObj[role] : [];
 }
+
+/* "Enable multimodality" toggle: off = backbone only.  The aux lists stay in
+   cfgObj (so re-enabling restores the cards); they are only dropped from the
+   dumped YAML, which is what /api/run consumes. */
+const mmEnabled = () => { const el = $("mm-enable"); return !el || el.checked; };
 
 function addAuxModule(role) {
   const list = auxList(role).slice();
@@ -988,7 +1031,13 @@ function auxTimesTable(mod, m) {
 function renderAuxModules() {
   const root = $("aux-modules");
   if (!root) return;
+  const mm = mmEnabled();
+  for (const id of ["add-encoder", "add-decoder"]) {
+    const btn = document.getElementById(id);
+    if (btn) btn.disabled = !mm;
+  }
   root.innerHTML = "";
+  if (!mm) return; // backbone only: keep the lists in cfgObj, hide the cards
   let migrated = false;
   for (const role of ["encoders", "decoders"])
     auxList(role).forEach((mod, idx) => {
@@ -1168,27 +1217,24 @@ function renderModelTimes() {
 
   const head = `<div class="mt-row mt-head"><span></span><span>Type</span>
       <span>Count</span><span>F <i class="unit">(ms)</i></span><span>B <i class="unit">(ms)</i></span><span>W <i class="unit">(ms)</i></span></div>`;
-  // mock only: dropdown that copies a profiled model's config into the mock
-  const alignRow = `<div class="mt-row mt-align"><span></span>
-      <span title="Copy the selected model's pattern, per-type times and model config into this mock; every value stays editable.">Align model</span><span></span>
-      <span class="mt-align-box"><select id="mt-align">
-        <option value="">--</option>
-        ${Object.keys(DYN_OPTS.model_layers || {}).map(n => `<option>${n}</option>`).join("")}
-      </select></span></div>`;
-  const wireAlign = () => {
-    const sel = el.querySelector("#mt-align");
-    if (!sel) return;
+  // Align model row (form grid, next to Pattern): mock only — the dropdown
+  // copies a profiled model's config into the mock
+  const alignRowEl = document.getElementById("align-row");
+  if (alignRowEl) {
+    alignRowEl.style.display = isMock ? "" : "none";
+    const sel = alignRowEl.querySelector("#mt-align");
+    const names = Object.keys(DYN_OPTS.model_layers || {});
+    if (sel.options.length !== names.length + 1)
+      sel.innerHTML = `<option value="">--</option>` +
+        names.map(n => `<option>${n}</option>`).join("");
     sel.value = alignSource; // keep showing which model the mock mirrors
-    sel.addEventListener("change", (ev) => {
-      if (ev.target.value) alignMockToModel(ev.target.value);
-    });
-  };
+  }
 
   if (isMock && hasPattern) {
     const t = mockTables(m);
     const { counts, order } = typeCounts(expandPat(m.pattern));
     const num = (v) => v === undefined || v === null ? "" : String(v);
-    let html = alignRow + head;
+    let html = head;
     for (const c of order) {
       const [cls, label] = SYM_INFO[c] || ["mlp", c];
       const fixed = c === "E" || c === "L";
@@ -1202,7 +1248,6 @@ function renderModelTimes() {
     }
     el.innerHTML = html;
     el.style.display = "";
-    wireAlign();
     for (const inp of el.querySelectorAll("input[data-sym]")) {
       inp.addEventListener("change", () => {
         const v = inp.value.trim() === "" ? undefined : Number(inp.value);
@@ -1236,14 +1281,13 @@ function renderModelTimes() {
     el.innerHTML = html;
     el.style.display = "";
   } else if (isMock) {
-    // legacy uniform mock (no pattern): still offer align as the way in
+    // legacy uniform mock (no pattern): the Align model row stays visible
     const info = ppLayerInfo();
-    el.innerHTML = alignRow + (info && info.uniform
+    el.innerHTML = info && info.uniform
       ? `<div class="mt-note">All layers: F ${fmtMs(info.uniform.f)} · B ${fmtMs(info.uniform.b)}
          · W ${fmtMs(info.uniform.w)} ms — embedding/head cost 0</div>`
-      : "");
+      : "";
     el.style.display = "";
-    wireAlign();
   } else {
     el.innerHTML = "";
     el.style.display = "none";
@@ -1584,6 +1628,288 @@ function syncTuningLock() {
     setLocked(ep, !moe,
       "Only MoE models use expert parallelism.", fieldDesc("parallel.ep_size"));
   }
+
+  // pipelines fix ZeRO at stage 1: higher stages shard grads/params across
+  // DP, which does not compose with PP's per-stage grad accumulation here
+  const zs = document.querySelector('[data-path="parallel.zero_stage"]');
+  if (zs) {
+    const pp = (getPath(cfgObj, "parallel.pp_size") || 1) > 1;
+    if (pp && getPath(cfgObj, "parallel.zero_stage") !== 1) {
+      setPath(cfgObj, "parallel.zero_stage", 1);
+      zs.value = "1";
+      scheduleDump();
+    }
+    setLocked(zs, pp, "Locked: ZeRO is fixed at stage 1 while PP > 1.",
+      fieldDesc("parallel.zero_stage"));
+  }
+}
+
+/* ============ variable-batch microbatch editor ============
+   With batch.mode = pack/pad the section lists one row per microbatch.
+   Exactly one column is active (the engine wants microbatches XOR
+   time_scales):
+   - "By seqs": edit the sequence lengths, the time cell shows the
+     compute-time multiplier the engine derives from them (filled in
+     after each run: attention scales with sum(len^2)/n*max^2, the rest
+     with the token count).
+   - "By time": edit per-microbatch time multipliers directly, seqs are
+     kept but greyed out.
+   The inactive column's values are stashed so flipping modes round-trips. */
+let batchStash = { times: [], seqs: [] };
+let batchCollapsed = false;
+let batchRandRange = { min: "", max: "" }; // Random button bounds (kept across re-renders)
+// Linear/quadratic compute-time shares from the last run's batch_derived:
+// with them the client recomputes each microbatch's ratio instantly while
+// typing (the engine's own formula), instead of waiting out the dump +
+// auto-rerun debounces and the simulation round-trip.  A run refreshes
+// them (they only drift when the model/partition changes).
+let batchCoeff = null; // {lin, quad}
+
+/* Local (lin, quad, tokens) of one microbatch vs the reference shape --
+   mirrors BatchConfig.scales() for pack/pad. */
+function batchLocalScales(i) {
+  const b = cfgObj.batch;
+  const seqs = b && Array.isArray(b.microbatches) ? b.microbatches[i] : null;
+  if (!seqs || !seqs.length) return null;
+  const rows = Math.max(1, getPath(cfgObj, "model.micro_batch_size") || 1);
+  const ref = Math.max(1, getPath(cfgObj, "model.seq_len") || 4096);
+  let lin, quad;
+  if (b.mode === "pad") {
+    const mx = Math.max(...seqs);
+    lin = seqs.length * mx;
+    quad = seqs.length * mx * mx;
+  } else {
+    lin = seqs.reduce((a, x) => a + x, 0);
+    quad = seqs.reduce((a, x) => a + x * x, 0);
+  }
+  return {
+    lin: lin / (rows * ref),
+    quad: quad / (rows * ref * ref),
+    tokens: seqs.reduce((a, x) => a + x, 0),
+  };
+}
+
+const batchOn = () => {
+  const m = getPath(cfgObj, "batch.mode");
+  return m === "pack" || m === "pad";
+};
+const batchUseTime = () => Array.isArray((cfgObj.batch || {}).time_scales);
+
+function batchRowCount() {
+  const n = getPath(cfgObj, "parallel.micro_batch_num");
+  if (n !== undefined && n >= 1) return Math.min(n, 4096);
+  const b = cfgObj.batch || {};
+  return (b.time_scales || b.microbatches || []).length || 8;
+}
+
+/* Keep the active array sized to the row count; returns true if changed. */
+function batchSyncArrays() {
+  const b = cfgObj.batch;
+  if (!b) return false;
+  const n = batchRowCount();
+  let changed = false;
+  if (batchUseTime()) {
+    const arr = b.time_scales;
+    while (arr.length < n) { arr.push(batchStash.times[arr.length] ?? 1); changed = true; }
+    if (arr.length > n) { arr.length = n; changed = true; }
+  } else {
+    if (!Array.isArray(b.microbatches)) { b.microbatches = []; changed = true; }
+    const arr = b.microbatches;
+    const defSeq = getPath(cfgObj, "model.seq_len") || 4096;
+    while (arr.length < n) {
+      const stash = batchStash.seqs[arr.length];
+      arr.push(stash && stash.length ? [...stash] : [defSeq]);
+      changed = true;
+    }
+    if (arr.length > n) { arr.length = n; changed = true; }
+  }
+  return changed;
+}
+
+function batchSetInputMode(useTime) {
+  const b = cfgObj.batch;
+  if (!b || batchUseTime() === useTime) return;
+  if (useTime) {
+    // seed the editable times from the derived ratios when we have them --
+    // flipping modes then starts from equivalent numbers
+    const seeds = Array.from({ length: batchRowCount() }, (_, i) => {
+      const s = batchCoeff && batchLocalScales(i);
+      return s ? +(batchCoeff.lin * s.lin + batchCoeff.quad * s.quad).toFixed(4)
+        : batchStash.times[i] ?? 1;
+    });
+    batchStash.seqs = (b.microbatches || []).map(s => [...s]);
+    b.time_scales = seeds;
+    delete b.microbatches;
+  } else {
+    batchStash.times = [...(b.time_scales || [])];
+    delete b.time_scales;
+    batchSyncArrays(); // restores stashed seqs / defaults
+  }
+  renderBatchMbs();
+  validateBatchLive();
+  scheduleDump();
+  scheduleAutoRun();
+}
+
+function renderBatchMbs() {
+  const box = $("batch-mbs");
+  if (!box) return;
+  const timeRef = document.querySelector('[data-path="batch.time_ref"]');
+  if (!batchOn()) {
+    box.innerHTML = "";
+    box.style.display = "none";
+    if (timeRef) timeRef.disabled = true;
+    return;
+  }
+  if (batchSyncArrays()) scheduleDump();
+  const useTime = batchUseTime();
+  if (timeRef) timeRef.disabled = !useTime;
+  const b = cfgObj.batch;
+  const n = batchRowCount();
+  box.style.display = "";
+  box.innerHTML = "";
+
+  const head = document.createElement("div");
+  head.className = "bmb-head";
+  const refSeq = getPath(cfgObj, "model.seq_len") || 4096;
+  const defMin = useTime ? 0.5 : Math.max(1, Math.round(refSeq / 4));
+  const defMax = useTime ? 2 : refSeq;
+  head.innerHTML =
+    `<button type="button" class="bmb-fold" title="Collapse / expand the rows">` +
+    `${batchCollapsed ? "&#9656;" : "&#9662;"}</button>` +
+    `<span class="bmb-title">Microbatches (${n})</span>` +
+    `<span class="bmb-rand" title="Fill every microbatch with a random ` +
+    `${useTime ? "time multiplier" : "sequence length"} drawn uniformly from [min, max]">` +
+    `<input class="bmb-rand-min" placeholder="${defMin}">` +
+    `<span class="bmb-rand-dash">&ndash;</span>` +
+    `<input class="bmb-rand-max" placeholder="${defMax}">` +
+    `<button type="button" class="bmb-rand-btn">Random</button>` +
+    `</span>` +
+    `<span class="bmb-modes">` +
+    `<button type="button" class="bmb-mode${useTime ? "" : " on"}" data-mode="seqs" ` +
+    `title="Edit sequence lengths; the compute time is derived from them">By seqs</button>` +
+    `<button type="button" class="bmb-mode${useTime ? " on" : ""}" data-mode="time" ` +
+    `title="Edit per-microbatch time multipliers directly">By time</button>` +
+    `</span>`;
+  head.querySelector(".bmb-fold").addEventListener("click", () => {
+    batchCollapsed = !batchCollapsed;
+    renderBatchMbs();
+  });
+  for (const btn of head.querySelectorAll(".bmb-mode"))
+    btn.addEventListener("click", () => batchSetInputMode(btn.dataset.mode === "time"));
+  const randMin = head.querySelector(".bmb-rand-min");
+  const randMax = head.querySelector(".bmb-rand-max");
+  randMin.value = batchRandRange.min;
+  randMax.value = batchRandRange.max;
+  randMin.addEventListener("input", () => { batchRandRange.min = randMin.value; });
+  randMax.addEventListener("input", () => { batchRandRange.max = randMax.value; });
+  head.querySelector(".bmb-rand-btn").addEventListener("click", () => {
+    let lo = parseFloat(randMin.value), hi = parseFloat(randMax.value);
+    if (!Number.isFinite(lo)) lo = defMin;
+    if (!Number.isFinite(hi)) hi = defMax;
+    if (hi < lo) [lo, hi] = [hi, lo];
+    if (useTime) {
+      b.time_scales = Array.from({ length: n }, () =>
+        +(lo + Math.random() * (hi - lo)).toFixed(3) || 0.001);
+    } else {
+      b.microbatches = Array.from({ length: n }, () =>
+        [Math.max(1, Math.round(lo + Math.random() * (hi - lo)))]);
+    }
+    renderBatchMbs();
+    validateBatchLive();
+    scheduleDump();
+    scheduleAutoRun();
+  });
+  box.appendChild(head);
+  if (batchCollapsed) return;
+
+  const grid = document.createElement("div");
+  grid.className = "bmb-grid"; // 3-up cells: "#i [time]" over a seqs input
+
+  for (let i = 0; i < n; i++) {
+    const cell = document.createElement("div");
+    cell.className = "bmb-cell";
+    const idx = document.createElement("span");
+    idx.className = "bmb-idx";
+    idx.textContent = `#${i}`;
+    const time = document.createElement("input");
+    time.type = "text";
+    time.className = "bmb-time";
+    time.dataset.i = i;
+    const seqs = document.createElement("input");
+    seqs.type = "text";
+    seqs.className = "bmb-seqs";
+    seqs.dataset.i = i;
+    if (useTime) {
+      time.value = b.time_scales[i];
+      time.title = "Compute-time multiplier vs the profiled reference microbatch " +
+        "(model.micro_batch_size x model.seq_len)";
+      seqs.disabled = true;
+      const stash = batchStash.seqs[i];
+      seqs.value = stash && stash.length ? stash.join(", ") : "";
+      seqs.title = "Greyed out: switch to 'By seqs' to edit sequence lengths";
+      time.addEventListener("input", () => {
+        const v = parseFloat(time.value);
+        const ok = Number.isFinite(v) && v > 0;
+        time.classList.toggle("invalid", !ok);
+        if (!ok) return;
+        b.time_scales[i] = v;
+        validateBatchLive();
+        scheduleDump();
+        scheduleAutoRun();
+      });
+    } else {
+      seqs.value = (b.microbatches[i] || []).join(", ");
+      seqs.title = "Sequence lengths packed/padded into this microbatch, " +
+        "comma-separated (tokens)";
+      time.disabled = true;
+      batchFillDerived(time, i);
+      seqs.addEventListener("input", () => {
+        const parts = seqs.value.split(/[\s,;]+/).filter(Boolean);
+        const vals = parts.map(Number);
+        const ok = vals.length > 0 && vals.every(v => Number.isInteger(v) && v > 0);
+        seqs.classList.toggle("invalid", !ok);
+        if (!ok) return;
+        b.microbatches[i] = vals;
+        batchFillDerived(time, i); // instant: local scales x cached shares
+        validateBatchLive();
+        scheduleDump();
+        scheduleAutoRun();
+      });
+      seqs.addEventListener("change", () => { seqs.title = seqs.value + " tokens per seq"; });
+    }
+    cell.append(idx, time, seqs);
+    grid.appendChild(cell);
+  }
+  box.appendChild(grid);
+}
+
+/* Derived-time cell: local scales weighted by the cached shares (instant
+   while typing); a placeholder only before the first run supplies them. */
+function batchFillDerived(cell, i) {
+  const s = batchCoeff && batchLocalScales(i);
+  if (s) {
+    const ratio = batchCoeff.lin * s.lin + batchCoeff.quad * s.quad;
+    cell.value = `Time: \u00d7${ratio.toFixed(3)}`;
+    cell.title = `Derived from this microbatch's sequence lengths vs the reference shape:\n` +
+      `token (linear) scale \u00d7${s.lin.toFixed(3)}, attention (quadratic) scale ` +
+      `\u00d7${s.quad.toFixed(3)}, ${s.tokens.toLocaleString()} tokens.\n` +
+      `Weighted by the model's attention share of compute time; encoder/decoder ` +
+      `blocks count in the linear (token) part.`;
+  } else {
+    cell.value = "Time: \u2026";
+    cell.title = "Derived after the next run (auto rerun fills this in)";
+  }
+}
+
+/* run() reports batch_derived with fresh lin/quad shares; re-weigh the
+   greyed time cells in place so typing focus is never disturbed. */
+function updateBatchDerived(derived) {
+  if (derived && derived.lin_share !== undefined)
+    batchCoeff = { lin: derived.lin_share, quad: derived.quad_share };
+  if (!batchOn() || batchUseTime()) return;
+  for (const cell of document.querySelectorAll("#batch-mbs .bmb-time"))
+    batchFillDerived(cell, Number(cell.dataset.i));
 }
 
 /* Batch rule: any batch content requires exactly one of microbatches /
@@ -1598,9 +1924,9 @@ function validateBatchLive() {
     const ts = Array.isArray(b.time_scales) ? b.time_scales.length : 0;
     const n = getPath(cfgObj, "parallel.micro_batch_num");
     if (!mb && !ts)
-      msg = "batch is enabled: provide microbatches (one line per microbatch) or time_scales.";
+      msg = "batch is enabled: fill the microbatch rows below (By seqs or By time).";
     else if (mb && ts)
-      msg = "batch: provide only one of microbatches / time_scales, not both.";
+      msg = "batch: provide only one of microbatches / time_scales, not both (pick a mode below).";
     else if (n !== undefined && (mb || ts) !== n)
       msg = `batch: ${mb ? "microbatches" : "time_scales"} count ${mb || ts} must equal parallel.micro_batch_num = ${n} (or clear micro_batch_num to derive it).`;
   }
@@ -1619,9 +1945,15 @@ function scheduleDump() { clearTimeout(dumpTimer); dumpTimer = setTimeout(dumpNo
 function dumpNow() {
   clearTimeout(dumpTimer); dumpTimer = null;
   dumpInflight = (async () => {
+    let data = cfgObj;
+    if (!mmEnabled() && (cfgObj.encoders || cfgObj.decoders)) {
+      data = { ...cfgObj }; // backbone only: aux modules stay out of the YAML
+      delete data.encoders;
+      delete data.decoders;
+    }
     const resp = await fetch("/api/dump", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ data: cfgObj }),
+      body: JSON.stringify({ data }),
     });
     const r = await resp.json();
     if (r.ok) $("config").value = r.text;
@@ -1656,6 +1988,11 @@ async function parseYamlToForm(showErrors) {
     const r = await resp.json();
     if (!r.ok) { if (showErrors) showError("YAML parse failed: " + r.error); return false; }
     cfgObj = r.data || {};
+    // a pasted / restored config with aux modules re-enables the toggle
+    // (otherwise the next dump would silently drop them)
+    const mmEl = $("mm-enable");
+    if (mmEl && !mmEl.checked && ((cfgObj.encoders || []).length || (cfgObj.decoders || []).length))
+      mmEl.checked = true;
     if (materializeDefaults()) scheduleDump(); // keep the YAML view in sync
     refreshFormValues();
     return true;
@@ -2430,6 +2767,7 @@ async function run() {
     renderPartPlace();
     setupGantt(r.gantt);
     renderRanks(r.ranks);
+    updateBatchDerived(r.batch_derived);
     $("config-out").textContent = r.pipeline_config;
     $("dl-svg").disabled = false;
     $("dl-config").disabled = false;
@@ -2472,6 +2810,11 @@ function scheduleAutoRun() {
 $("config").addEventListener("input", () => {
   // YAML edits count as config changes too (run posts the raw YAML text)
   if ($("panel-config").classList.contains("mode-form")) return;
+  scheduleAutoRun();
+});
+$("mm-enable").addEventListener("change", () => {
+  renderAuxModules();   // show/hide cards, grey the + Encoder / + Decoder pair
+  scheduleDump();       // YAML gains/drops the aux module lists
   scheduleAutoRun();
 });
 document.addEventListener("keydown", (ev) => {
