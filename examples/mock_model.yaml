@@ -5,7 +5,8 @@
 #   (backward_ms defaults to forward_ms, weight_ms to backward_ms, E/L to 0)
 # - 32 layers / pp_size 8 -> 4 layers per stage -> stage F = 4 ms
 # - p2p_latency_ms 0.4 ms = 10% of a stage forward (communication)
-# - batch: off (all 16 microbatches identical)
+# - batch: pack with every microbatch at the reference length (scale 1.0);
+#   edit the per-microbatch rows in the UI to make them uneven
 schedule: 1f1b
 profiled_data: true
 time_limit: 20000000
@@ -46,16 +47,26 @@ parallel:
 hardware:
   p2p_latency_ms: 0.4      # cross-stage transfer = 10% of stage forward time
 
-# Variable-length microbatches are OFF here.  To enable, add a batch section
-# with exactly ONE of the two specs, sized to micro_batch_num:
-#
-# batch:
-#   mode: pack             # pack | pad
-#   microbatches:          # one line per microbatch (16 lines for nmb=16)
-#   - [4096]
-#   - [2048, 2048]
-#   ...
-#
-# batch:
-#   mode: pack
-#   time_scales: [1, 1, 1.2, 1.2, 1.5, 1.5, 1, 1, 1, 1, 2, 2, 1, 1, 0.8, 0.8]
+# Variable-length microbatches: exactly ONE of microbatches / time_scales,
+# sized to micro_batch_num.  Every row at the reference seq_len (4096) is a
+# 1.0x scale, so this default behaves like a uniform batch; alternatively
+# "time_scales: [1, 1.2, ...]" gives direct per-microbatch multipliers.
+batch:
+  mode: pack               # pack: concat (varlen kernels) | pad: pad to max
+  microbatches:
+  - [4096]
+  - [4096]
+  - [4096]
+  - [4096]
+  - [4096]
+  - [4096]
+  - [4096]
+  - [4096]
+  - [4096]
+  - [4096]
+  - [4096]
+  - [4096]
+  - [4096]
+  - [4096]
+  - [4096]
+  - [4096]

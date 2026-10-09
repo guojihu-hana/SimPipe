@@ -243,15 +243,9 @@ const CFG_SCHEMA = [
   ]},
   { sec: "Batch: Variable-length microbatches", id: "batch", fields: [
     { path: "batch.mode", type: "select", options: ["", "pack", "pad"], emptyLabel: "Off",
-      desc: "pack: concat sequences, varlen kernels (linear ~ sum(len), attention ~ sum(len^2)); pad: pad to the longest sequence (linear ~ n*max, attention ~ n*max^2). Requires exactly one of microbatches / time_scales below." },
-    { path: "batch.microbatches", type: "lines", wide: true, itemMin: 1, itemMax: 16777216,
-      ph: "4096\n2048, 2048\n...  (one microbatch per line; line count = micro_batch_num)",
-      desc: "Sequence lengths per microbatch, one microbatch per line. The line count must equal parallel.micro_batch_num (or leave micro_batch_num empty to derive it)." },
-    { path: "batch.time_scales", type: "floatlist", wide: true, itemMin: 1e-6, itemMax: 1e9,
-      ph: "1, 1.2, 1.8, ...  (count = micro_batch_num)",
-      desc: "Direct per-microbatch compute multipliers. Count must equal parallel.micro_batch_num. With time_ref the values are absolute times. Mutually exclusive with microbatches." },
+      desc: "pack: concat sequences, varlen kernels (linear ~ sum(len), attention ~ sum(len^2)); pad: pad to the longest sequence (linear ~ n*max, attention ~ n*max^2). Turning it on lists one editable row per microbatch below." },
     { path: "batch.time_ref", type: "float", def: 1.0, min: 1e-6, max: 1e12,
-      desc: "Reference for absolute time_scales: scale = value / time_ref." },
+      desc: "Reference for absolute times in 'By time' mode: scale = value / time_ref (1.0 = values are already multipliers)." },
   ]},
   { sec: "Tuning", fields: [
     { path: "tuning.auto_tune", type: "bool", def: false,
@@ -509,6 +503,9 @@ function buildForm() {
       box.appendChild(aux);
     }
     if (sec.id === "batch") {
+      const mbs = document.createElement("div");
+      mbs.id = "batch-mbs"; // per-microbatch rows (time | seqs), filled dynamically
+      box.appendChild(mbs);
       const warn = document.createElement("div");
       warn.className = "form-warn";
       warn.id = "batch-warn";
@@ -588,6 +585,22 @@ function onFormEdit(ev, fields) {
         if (dpEl) dpEl.value = String(ep);
       }
     }
+    if (f.path === "batch.mode") {
+      if (val === undefined) {
+        // Off: drop the whole batch block (a bare mode would fail the
+        // engine's "exactly one of microbatches/time_scales" rule) but
+        // stash the rows so switching back restores them
+        const b = cfgObj.batch || {};
+        if (Array.isArray(b.microbatches)) batchStash.seqs = b.microbatches.map(s => [...s]);
+        if (Array.isArray(b.time_scales)) batchStash.times = [...b.time_scales];
+        delete cfgObj.batch;
+      } else if (!batchUseTime() && !Array.isArray((cfgObj.batch || {}).microbatches)) {
+        cfgObj.batch.microbatches = []; // fresh enable: start in "By seqs"
+      }
+      renderBatchMbs();
+    }
+    if (f.path === "parallel.micro_batch_num" || f.path === "model.seq_len")
+      renderBatchMbs(); // row count / default seq length follow these
     scheduleDump();
     scheduleAutoRun();
   } catch (err) {
@@ -612,6 +625,7 @@ function refreshFormValues() {
   renderPartPlace();
   renderModelTimes();
   renderAuxModules();
+  renderBatchMbs();
 }
 
 /* ============ multimodal encoders / decoders ============
@@ -1630,6 +1644,274 @@ function syncTuningLock() {
   }
 }
 
+/* ============ variable-batch microbatch editor ============
+   With batch.mode = pack/pad the section lists one row per microbatch.
+   Exactly one column is active (the engine wants microbatches XOR
+   time_scales):
+   - "By seqs": edit the sequence lengths, the time cell shows the
+     compute-time multiplier the engine derives from them (filled in
+     after each run: attention scales with sum(len^2)/n*max^2, the rest
+     with the token count).
+   - "By time": edit per-microbatch time multipliers directly, seqs are
+     kept but greyed out.
+   The inactive column's values are stashed so flipping modes round-trips. */
+let batchStash = { times: [], seqs: [] };
+let batchCollapsed = false;
+let batchRandRange = { min: "", max: "" }; // Random button bounds (kept across re-renders)
+// Linear/quadratic compute-time shares from the last run's batch_derived:
+// with them the client recomputes each microbatch's ratio instantly while
+// typing (the engine's own formula), instead of waiting out the dump +
+// auto-rerun debounces and the simulation round-trip.  A run refreshes
+// them (they only drift when the model/partition changes).
+let batchCoeff = null; // {lin, quad}
+
+/* Local (lin, quad, tokens) of one microbatch vs the reference shape --
+   mirrors BatchConfig.scales() for pack/pad. */
+function batchLocalScales(i) {
+  const b = cfgObj.batch;
+  const seqs = b && Array.isArray(b.microbatches) ? b.microbatches[i] : null;
+  if (!seqs || !seqs.length) return null;
+  const rows = Math.max(1, getPath(cfgObj, "model.micro_batch_size") || 1);
+  const ref = Math.max(1, getPath(cfgObj, "model.seq_len") || 4096);
+  let lin, quad;
+  if (b.mode === "pad") {
+    const mx = Math.max(...seqs);
+    lin = seqs.length * mx;
+    quad = seqs.length * mx * mx;
+  } else {
+    lin = seqs.reduce((a, x) => a + x, 0);
+    quad = seqs.reduce((a, x) => a + x * x, 0);
+  }
+  return {
+    lin: lin / (rows * ref),
+    quad: quad / (rows * ref * ref),
+    tokens: seqs.reduce((a, x) => a + x, 0),
+  };
+}
+
+const batchOn = () => {
+  const m = getPath(cfgObj, "batch.mode");
+  return m === "pack" || m === "pad";
+};
+const batchUseTime = () => Array.isArray((cfgObj.batch || {}).time_scales);
+
+function batchRowCount() {
+  const n = getPath(cfgObj, "parallel.micro_batch_num");
+  if (n !== undefined && n >= 1) return Math.min(n, 4096);
+  const b = cfgObj.batch || {};
+  return (b.time_scales || b.microbatches || []).length || 8;
+}
+
+/* Keep the active array sized to the row count; returns true if changed. */
+function batchSyncArrays() {
+  const b = cfgObj.batch;
+  if (!b) return false;
+  const n = batchRowCount();
+  let changed = false;
+  if (batchUseTime()) {
+    const arr = b.time_scales;
+    while (arr.length < n) { arr.push(batchStash.times[arr.length] ?? 1); changed = true; }
+    if (arr.length > n) { arr.length = n; changed = true; }
+  } else {
+    if (!Array.isArray(b.microbatches)) { b.microbatches = []; changed = true; }
+    const arr = b.microbatches;
+    const defSeq = getPath(cfgObj, "model.seq_len") || 4096;
+    while (arr.length < n) {
+      const stash = batchStash.seqs[arr.length];
+      arr.push(stash && stash.length ? [...stash] : [defSeq]);
+      changed = true;
+    }
+    if (arr.length > n) { arr.length = n; changed = true; }
+  }
+  return changed;
+}
+
+function batchSetInputMode(useTime) {
+  const b = cfgObj.batch;
+  if (!b || batchUseTime() === useTime) return;
+  if (useTime) {
+    // seed the editable times from the derived ratios when we have them --
+    // flipping modes then starts from equivalent numbers
+    const seeds = Array.from({ length: batchRowCount() }, (_, i) => {
+      const s = batchCoeff && batchLocalScales(i);
+      return s ? +(batchCoeff.lin * s.lin + batchCoeff.quad * s.quad).toFixed(4)
+        : batchStash.times[i] ?? 1;
+    });
+    batchStash.seqs = (b.microbatches || []).map(s => [...s]);
+    b.time_scales = seeds;
+    delete b.microbatches;
+  } else {
+    batchStash.times = [...(b.time_scales || [])];
+    delete b.time_scales;
+    batchSyncArrays(); // restores stashed seqs / defaults
+  }
+  renderBatchMbs();
+  validateBatchLive();
+  scheduleDump();
+  scheduleAutoRun();
+}
+
+function renderBatchMbs() {
+  const box = $("batch-mbs");
+  if (!box) return;
+  const timeRef = document.querySelector('[data-path="batch.time_ref"]');
+  if (!batchOn()) {
+    box.innerHTML = "";
+    box.style.display = "none";
+    if (timeRef) timeRef.disabled = true;
+    return;
+  }
+  if (batchSyncArrays()) scheduleDump();
+  const useTime = batchUseTime();
+  if (timeRef) timeRef.disabled = !useTime;
+  const b = cfgObj.batch;
+  const n = batchRowCount();
+  box.style.display = "";
+  box.innerHTML = "";
+
+  const head = document.createElement("div");
+  head.className = "bmb-head";
+  const refSeq = getPath(cfgObj, "model.seq_len") || 4096;
+  const defMin = useTime ? 0.5 : Math.max(1, Math.round(refSeq / 4));
+  const defMax = useTime ? 2 : refSeq;
+  head.innerHTML =
+    `<button type="button" class="bmb-fold" title="Collapse / expand the rows">` +
+    `${batchCollapsed ? "&#9656;" : "&#9662;"}</button>` +
+    `<span class="bmb-title">Microbatches (${n})</span>` +
+    `<span class="bmb-rand" title="Fill every microbatch with a random ` +
+    `${useTime ? "time multiplier" : "sequence length"} drawn uniformly from [min, max]">` +
+    `<input class="bmb-rand-min" placeholder="${defMin}">` +
+    `<span class="bmb-rand-dash">&ndash;</span>` +
+    `<input class="bmb-rand-max" placeholder="${defMax}">` +
+    `<button type="button" class="bmb-rand-btn">Random</button>` +
+    `</span>` +
+    `<span class="bmb-modes">` +
+    `<button type="button" class="bmb-mode${useTime ? "" : " on"}" data-mode="seqs" ` +
+    `title="Edit sequence lengths; the compute time is derived from them">By seqs</button>` +
+    `<button type="button" class="bmb-mode${useTime ? " on" : ""}" data-mode="time" ` +
+    `title="Edit per-microbatch time multipliers directly">By time</button>` +
+    `</span>`;
+  head.querySelector(".bmb-fold").addEventListener("click", () => {
+    batchCollapsed = !batchCollapsed;
+    renderBatchMbs();
+  });
+  for (const btn of head.querySelectorAll(".bmb-mode"))
+    btn.addEventListener("click", () => batchSetInputMode(btn.dataset.mode === "time"));
+  const randMin = head.querySelector(".bmb-rand-min");
+  const randMax = head.querySelector(".bmb-rand-max");
+  randMin.value = batchRandRange.min;
+  randMax.value = batchRandRange.max;
+  randMin.addEventListener("input", () => { batchRandRange.min = randMin.value; });
+  randMax.addEventListener("input", () => { batchRandRange.max = randMax.value; });
+  head.querySelector(".bmb-rand-btn").addEventListener("click", () => {
+    let lo = parseFloat(randMin.value), hi = parseFloat(randMax.value);
+    if (!Number.isFinite(lo)) lo = defMin;
+    if (!Number.isFinite(hi)) hi = defMax;
+    if (hi < lo) [lo, hi] = [hi, lo];
+    if (useTime) {
+      b.time_scales = Array.from({ length: n }, () =>
+        +(lo + Math.random() * (hi - lo)).toFixed(3) || 0.001);
+    } else {
+      b.microbatches = Array.from({ length: n }, () =>
+        [Math.max(1, Math.round(lo + Math.random() * (hi - lo)))]);
+    }
+    renderBatchMbs();
+    validateBatchLive();
+    scheduleDump();
+    scheduleAutoRun();
+  });
+  box.appendChild(head);
+  if (batchCollapsed) return;
+
+  const grid = document.createElement("div");
+  grid.className = "bmb-grid"; // 3-up cells: "#i [time]" over a seqs input
+
+  for (let i = 0; i < n; i++) {
+    const cell = document.createElement("div");
+    cell.className = "bmb-cell";
+    const idx = document.createElement("span");
+    idx.className = "bmb-idx";
+    idx.textContent = `#${i}`;
+    const time = document.createElement("input");
+    time.type = "text";
+    time.className = "bmb-time";
+    time.dataset.i = i;
+    const seqs = document.createElement("input");
+    seqs.type = "text";
+    seqs.className = "bmb-seqs";
+    seqs.dataset.i = i;
+    if (useTime) {
+      time.value = b.time_scales[i];
+      time.title = "Compute-time multiplier vs the profiled reference microbatch " +
+        "(model.micro_batch_size x model.seq_len)";
+      seqs.disabled = true;
+      const stash = batchStash.seqs[i];
+      seqs.value = stash && stash.length ? stash.join(", ") : "";
+      seqs.title = "Greyed out: switch to 'By seqs' to edit sequence lengths";
+      time.addEventListener("input", () => {
+        const v = parseFloat(time.value);
+        const ok = Number.isFinite(v) && v > 0;
+        time.classList.toggle("invalid", !ok);
+        if (!ok) return;
+        b.time_scales[i] = v;
+        validateBatchLive();
+        scheduleDump();
+        scheduleAutoRun();
+      });
+    } else {
+      seqs.value = (b.microbatches[i] || []).join(", ");
+      seqs.title = "Sequence lengths packed/padded into this microbatch, " +
+        "comma-separated (tokens)";
+      time.disabled = true;
+      batchFillDerived(time, i);
+      seqs.addEventListener("input", () => {
+        const parts = seqs.value.split(/[\s,;]+/).filter(Boolean);
+        const vals = parts.map(Number);
+        const ok = vals.length > 0 && vals.every(v => Number.isInteger(v) && v > 0);
+        seqs.classList.toggle("invalid", !ok);
+        if (!ok) return;
+        b.microbatches[i] = vals;
+        batchFillDerived(time, i); // instant: local scales x cached shares
+        validateBatchLive();
+        scheduleDump();
+        scheduleAutoRun();
+      });
+      seqs.addEventListener("change", () => { seqs.title = seqs.value + " tokens per seq"; });
+    }
+    cell.append(idx, time, seqs);
+    grid.appendChild(cell);
+  }
+  box.appendChild(grid);
+}
+
+/* Derived-time cell: local scales weighted by the cached shares (instant
+   while typing); a placeholder only before the first run supplies them. */
+function batchFillDerived(cell, i) {
+  const s = batchCoeff && batchLocalScales(i);
+  if (s) {
+    const ratio = batchCoeff.lin * s.lin + batchCoeff.quad * s.quad;
+    cell.value = `Time: \u00d7${ratio.toFixed(3)}`;
+    cell.title = `Derived from this microbatch's sequence lengths vs the reference shape:\n` +
+      `token (linear) scale \u00d7${s.lin.toFixed(3)}, attention (quadratic) scale ` +
+      `\u00d7${s.quad.toFixed(3)}, ${s.tokens.toLocaleString()} tokens.\n` +
+      `Weighted by the model's attention share of compute time; encoder/decoder ` +
+      `blocks count in the linear (token) part.`;
+  } else {
+    cell.value = "Time: \u2026";
+    cell.title = "Derived after the next run (auto rerun fills this in)";
+  }
+}
+
+/* run() reports batch_derived with fresh lin/quad shares; re-weigh the
+   greyed time cells in place so typing focus is never disturbed. */
+function updateBatchDerived(derived) {
+  if (derived && derived.lin_share !== undefined)
+    batchCoeff = { lin: derived.lin_share, quad: derived.quad_share };
+  if (!batchOn() || batchUseTime()) return;
+  for (const cell of document.querySelectorAll("#batch-mbs .bmb-time"))
+    batchFillDerived(cell, Number(cell.dataset.i));
+}
+
 /* Batch rule: any batch content requires exactly one of microbatches /
    time_scales, sized to parallel.micro_batch_num when that is set. */
 function validateBatchLive() {
@@ -1642,9 +1924,9 @@ function validateBatchLive() {
     const ts = Array.isArray(b.time_scales) ? b.time_scales.length : 0;
     const n = getPath(cfgObj, "parallel.micro_batch_num");
     if (!mb && !ts)
-      msg = "batch is enabled: provide microbatches (one line per microbatch) or time_scales.";
+      msg = "batch is enabled: fill the microbatch rows below (By seqs or By time).";
     else if (mb && ts)
-      msg = "batch: provide only one of microbatches / time_scales, not both.";
+      msg = "batch: provide only one of microbatches / time_scales, not both (pick a mode below).";
     else if (n !== undefined && (mb || ts) !== n)
       msg = `batch: ${mb ? "microbatches" : "time_scales"} count ${mb || ts} must equal parallel.micro_batch_num = ${n} (or clear micro_batch_num to derive it).`;
   }
@@ -2485,6 +2767,7 @@ async function run() {
     renderPartPlace();
     setupGantt(r.gantt);
     renderRanks(r.ranks);
+    updateBatchDerived(r.batch_derived);
     $("config-out").textContent = r.pipeline_config;
     $("dl-svg").disabled = false;
     $("dl-config").disabled = false;
