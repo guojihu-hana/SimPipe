@@ -10,6 +10,16 @@ class InterleavedStrategy(ScheduleStrategy):
     name = Schedule.INTERLEAVED
 
     def generate(self, ctx: ScheduleContext) -> list[list[tuple[WorkloadType, int, int]]]:
+        # Same constraint as Megatron's interleaved schedule.  The chunk
+        # rotation below only advances when a device's F/B count reaches a
+        # multiple of device_num; with a non-divisible micro_batch_num the
+        # rotation starves once a chunk's microbatches run out and the
+        # while loop spins forever.
+        if ctx.micro_batch_num % ctx.device_num != 0:
+            raise ValueError(
+                "interleaved schedule requires micro_batch_num "
+                f"({ctx.micro_batch_num}) divisible by pp_size ({ctx.device_num})"
+            )
         workload_type_num = 2
         mid_offset = ctx.mid_offset
         schedule: list[list[tuple[WorkloadType, int, int]]] = [
