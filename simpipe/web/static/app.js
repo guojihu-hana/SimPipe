@@ -644,6 +644,11 @@ function auxList(role) {
   return Array.isArray(cfgObj[role]) ? cfgObj[role] : [];
 }
 
+/* "Enable multimodality" toggle: off = backbone only.  The aux lists stay in
+   cfgObj (so re-enabling restores the cards); they are only dropped from the
+   dumped YAML, which is what /api/run consumes. */
+const mmEnabled = () => { const el = $("mm-enable"); return !el || el.checked; };
+
 function addAuxModule(role) {
   const list = auxList(role).slice();
   const isEnc = role === "encoders";
@@ -1012,7 +1017,13 @@ function auxTimesTable(mod, m) {
 function renderAuxModules() {
   const root = $("aux-modules");
   if (!root) return;
+  const mm = mmEnabled();
+  for (const id of ["add-encoder", "add-decoder"]) {
+    const btn = document.getElementById(id);
+    if (btn) btn.disabled = !mm;
+  }
   root.innerHTML = "";
+  if (!mm) return; // backbone only: keep the lists in cfgObj, hide the cards
   let migrated = false;
   for (const role of ["encoders", "decoders"])
     auxList(role).forEach((mod, idx) => {
@@ -1652,9 +1663,15 @@ function scheduleDump() { clearTimeout(dumpTimer); dumpTimer = setTimeout(dumpNo
 function dumpNow() {
   clearTimeout(dumpTimer); dumpTimer = null;
   dumpInflight = (async () => {
+    let data = cfgObj;
+    if (!mmEnabled() && (cfgObj.encoders || cfgObj.decoders)) {
+      data = { ...cfgObj }; // backbone only: aux modules stay out of the YAML
+      delete data.encoders;
+      delete data.decoders;
+    }
     const resp = await fetch("/api/dump", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ data: cfgObj }),
+      body: JSON.stringify({ data }),
     });
     const r = await resp.json();
     if (r.ok) $("config").value = r.text;
@@ -1689,6 +1706,11 @@ async function parseYamlToForm(showErrors) {
     const r = await resp.json();
     if (!r.ok) { if (showErrors) showError("YAML parse failed: " + r.error); return false; }
     cfgObj = r.data || {};
+    // a pasted / restored config with aux modules re-enables the toggle
+    // (otherwise the next dump would silently drop them)
+    const mmEl = $("mm-enable");
+    if (mmEl && !mmEl.checked && ((cfgObj.encoders || []).length || (cfgObj.decoders || []).length))
+      mmEl.checked = true;
     if (materializeDefaults()) scheduleDump(); // keep the YAML view in sync
     refreshFormValues();
     return true;
@@ -2505,6 +2527,11 @@ function scheduleAutoRun() {
 $("config").addEventListener("input", () => {
   // YAML edits count as config changes too (run posts the raw YAML text)
   if ($("panel-config").classList.contains("mode-form")) return;
+  scheduleAutoRun();
+});
+$("mm-enable").addEventListener("change", () => {
+  renderAuxModules();   // show/hide cards, grey the + Encoder / + Decoder pair
+  scheduleDump();       // YAML gains/drops the aux module lists
   scheduleAutoRun();
 });
 document.addEventListener("keydown", (ev) => {
