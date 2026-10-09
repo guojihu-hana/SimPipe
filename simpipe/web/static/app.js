@@ -202,9 +202,9 @@ const CFG_SCHEMA = [
       desc: "Simulation tick budget in 0.01 ms units; the run reports STALLED when exceeded." },
   ]},
   { sec: "Model", fields: [
-    { path: "model.name", type: "dselect", optsKey: "models", def: "mock_model", noEmpty: true,
+    { path: "model.name", type: "dselect", optsKey: "models", def: "mock_model", noEmpty: true, label: "Config",
       desc: "Profiled model (has profiles/<name>.json) or mock_model for synthetic timings. Custom names (used with profile_times_path) can be set in the YAML view." },
-    { path: "model.num_layers", type: "int", def: 32, min: 1, max: 4096,
+    { path: "model.num_layers", type: "int", def: 32, min: 1, max: 4096, label: "#Layers",
       desc: "Transformer body layer count (embedding/head excluded)." },
     { path: "model.pattern", type: "text", ph: "ET*32L",
       desc: "Layer pattern: E embedding, L head, body types M mamba / * attn / - MLP / T transformer / # MoE; X*N repeats X N times. Editable for mock_model (num_layers follows the pattern; raising num_layers pads T). Profiled models show their pattern read-only. Hover to see the full pattern." },
@@ -217,26 +217,28 @@ const CFG_SCHEMA = [
     { path: "model.layer_w_time", type: "float", min: 0.01, max: 1e9, mockOnly: true,
       desc: "Mock timing: weight-update duration override; defaults to the forward time." },
   ]},
-  { sec: "Parallel", fields: [
+  // compact 4-up grid; row 1 and row 2 pair up column-wise
+  // (PP/EP, TP/DP, Zero/Seq len, mb size / #mbs) with per-column label widths
+  { sec: "Parallel", compact: true, fields: [
     { path: "parallel.pp_size", type: "int", def: 1, min: 1, max: 1024,
       desc: "Pipeline-parallel size = number of devices." },
     { path: "parallel.tp_size", type: "int", def: 8, min: 1, max: 64,
       desc: "Tensor-parallel size; scales analytic timing and per-rank model/activation memory." },
+    { path: "parallel.zero_stage", type: "int", def: 1, min: 0, max: 3,
+      desc: "ZeRO stage (0-3) used by the per-rank model-state memory estimate." },
+    { path: "model.micro_batch_size", type: "int", def: 1, min: 1, max: 65536, label: "Micro-batch size",
+      desc: "Reference microbatch size of the profiled shape." },
     { path: "parallel.ep_size", type: "int", def: 1, min: 1, max: 512,
       desc: "Expert-parallel size for MoE models; shards experts across ranks." },
     { path: "parallel.dp_size", type: "int", def: 1, min: 1, max: 4096,
       desc: "Data-parallel size; with ZeRO it shards optimizer/gradient state in the memory estimate." },
-    { path: "parallel.zero_stage", type: "int", def: 1, min: 0, max: 3,
-      desc: "ZeRO stage (0-3) used by the per-rank model-state memory estimate." },
     { path: "model.seq_len", type: "int", def: 4096, min: 1, max: 16777216,
       desc: "Reference sequence length of the profiled shape; varlen batch scales relative to it." },
-    { path: "parallel.micro_batch_num", type: "int", def: 8, min: 1, max: 16384,
+    { path: "parallel.micro_batch_num", type: "int", def: 8, min: 1, max: 16384, label: "#Micro-batches",
       desc: "Microbatches per iteration. Derived from batch.microbatches / batch.time_scales when those are set." },
-    { path: "model.micro_batch_size", type: "int", def: 1, min: 1, max: 65536,
-      desc: "Reference microbatch size of the profiled shape." },
     { path: "parallel.bwd_split", type: "bool", desc: "Split backward into B (grad-input) and W (grad-weight) workloads (zero-bubble style)." },
     { path: "model.recompute", type: "bool", desc: "Full activation recompute: each backward re-runs the forward first." },
-    { path: "parallel.chunk_num", type: "int", min: 1, max: 256, ph: "auto",
+    { path: "parallel.chunk_num", type: "int", min: 1, max: 256, ph: "auto", label: "#Chunk",
       desc: "Virtual-pipeline chunks per device; empty = auto (interleaved: max, else 1)." },
   ]},
   { sec: "Batch: Variable-length microbatches", id: "batch", fields: [
@@ -434,7 +436,8 @@ function buildForm() {
   const root = $("config-form");
   for (const sec of CFG_SCHEMA) {
     const box = document.createElement("div");
-    box.className = "form-sec";
+    // compact: 4-up cells with the label above the input (short numerics)
+    box.className = sec.compact ? "form-sec compact" : "form-sec";
     box.innerHTML = `<h4>${sec.sec}</h4>`;
     const fgrid = document.createElement("div");
     fgrid.className = "fgrid";
@@ -443,7 +446,7 @@ function buildForm() {
       row.className = f.wide ? "frow wide" : "frow";
       if (f.mockOnly) row.dataset.mockonly = "1"; // hidden unless mock_model
       row.title = f.desc; // hover shows the comment
-      const name = labelize(f.path.split(".").pop());
+      const name = f.label || labelize(f.path.split(".").pop());
       const ph = f.ph !== undefined ? f.ph : (f.def !== undefined ? String(f.def) : "");
       const phAttr = ph ? ` placeholder="${String(ph).replace(/"/g, "&quot;")}"` : "";
       let ctl;
@@ -468,8 +471,9 @@ function buildForm() {
     }
     box.appendChild(fgrid);
     if (sec.sec === "Model") {
-      // + Encoder / + Decoder live in the grid cell next to the (shortened)
-      // pattern box; the pattern's full text shows on hover
+      // 3-up grid: row 1 = Name | #Layers | Multimodal (+Enc/+Dec buttons),
+      // row 2 = Pattern (two cells, hover shows full text) | Align model
+      fgrid.classList.add("model-grid");
       const addRow = document.createElement("div");
       addRow.className = "frow aux-add-row";
       addRow.innerHTML =
@@ -477,9 +481,25 @@ function buildForm() {
         `<button type="button" class="small" id="add-encoder" title="Add a multimodal encoder: every microbatch runs all encoders before backbone stage 0.">+ Encoder</button>` +
         `<button type="button" class="small" id="add-decoder" title="Add a decoder behind the last stage: its F follows the last stage's F and its B gates the last stage's B.">+ Decoder</button></span>`;
       const patRow = fgrid.querySelector('[data-path="model.pattern"]').closest(".frow");
-      patRow.after(addRow);
+      patRow.classList.add("pattern-row");
+      // fixed label widths (CSS) align the input edges column-wise:
+      // Name with Pattern, Multimodal with Align model
+      fgrid.querySelector('[data-path="model.name"]').closest(".frow")
+        .classList.add("name-row");
+      patRow.before(addRow);
       addRow.querySelector("#add-encoder").addEventListener("click", () => addAuxModule("encoders"));
       addRow.querySelector("#add-decoder").addEventListener("click", () => addAuxModule("decoders"));
+      // Align model: mock only (renderModelTimes toggles it and fills options)
+      const alignRow = document.createElement("div");
+      alignRow.className = "frow";
+      alignRow.id = "align-row";
+      alignRow.innerHTML =
+        `<label title="Copy the selected model's pattern, per-type times and model config into this mock; every value stays editable.">Align model</label>` +
+        `<select id="mt-align"><option value="">--</option></select>`;
+      patRow.after(alignRow);
+      alignRow.querySelector("#mt-align").addEventListener("change", (ev) => {
+        if (ev.target.value) alignMockToModel(ev.target.value);
+      });
 
       const mt = document.createElement("div");
       mt.id = "model-times"; // per-layer-type f/b/w table, filled dynamically
@@ -1172,27 +1192,24 @@ function renderModelTimes() {
 
   const head = `<div class="mt-row mt-head"><span></span><span>Type</span>
       <span>Count</span><span>F <i class="unit">(ms)</i></span><span>B <i class="unit">(ms)</i></span><span>W <i class="unit">(ms)</i></span></div>`;
-  // mock only: dropdown that copies a profiled model's config into the mock
-  const alignRow = `<div class="mt-row mt-align"><span></span>
-      <span title="Copy the selected model's pattern, per-type times and model config into this mock; every value stays editable.">Align model</span><span></span>
-      <span class="mt-align-box"><select id="mt-align">
-        <option value="">--</option>
-        ${Object.keys(DYN_OPTS.model_layers || {}).map(n => `<option>${n}</option>`).join("")}
-      </select></span></div>`;
-  const wireAlign = () => {
-    const sel = el.querySelector("#mt-align");
-    if (!sel) return;
+  // Align model row (form grid, next to Pattern): mock only — the dropdown
+  // copies a profiled model's config into the mock
+  const alignRowEl = document.getElementById("align-row");
+  if (alignRowEl) {
+    alignRowEl.style.display = isMock ? "" : "none";
+    const sel = alignRowEl.querySelector("#mt-align");
+    const names = Object.keys(DYN_OPTS.model_layers || {});
+    if (sel.options.length !== names.length + 1)
+      sel.innerHTML = `<option value="">--</option>` +
+        names.map(n => `<option>${n}</option>`).join("");
     sel.value = alignSource; // keep showing which model the mock mirrors
-    sel.addEventListener("change", (ev) => {
-      if (ev.target.value) alignMockToModel(ev.target.value);
-    });
-  };
+  }
 
   if (isMock && hasPattern) {
     const t = mockTables(m);
     const { counts, order } = typeCounts(expandPat(m.pattern));
     const num = (v) => v === undefined || v === null ? "" : String(v);
-    let html = alignRow + head;
+    let html = head;
     for (const c of order) {
       const [cls, label] = SYM_INFO[c] || ["mlp", c];
       const fixed = c === "E" || c === "L";
@@ -1206,7 +1223,6 @@ function renderModelTimes() {
     }
     el.innerHTML = html;
     el.style.display = "";
-    wireAlign();
     for (const inp of el.querySelectorAll("input[data-sym]")) {
       inp.addEventListener("change", () => {
         const v = inp.value.trim() === "" ? undefined : Number(inp.value);
@@ -1240,14 +1256,13 @@ function renderModelTimes() {
     el.innerHTML = html;
     el.style.display = "";
   } else if (isMock) {
-    // legacy uniform mock (no pattern): still offer align as the way in
+    // legacy uniform mock (no pattern): the Align model row stays visible
     const info = ppLayerInfo();
-    el.innerHTML = alignRow + (info && info.uniform
+    el.innerHTML = info && info.uniform
       ? `<div class="mt-note">All layers: F ${fmtMs(info.uniform.f)} · B ${fmtMs(info.uniform.b)}
          · W ${fmtMs(info.uniform.w)} ms — embedding/head cost 0</div>`
-      : "");
+      : "";
     el.style.display = "";
-    wireAlign();
   } else {
     el.innerHTML = "";
     el.style.display = "none";
