@@ -326,9 +326,14 @@ class PipelineRuntime:
                     w.aux_role = inst.role
                     return w
 
-                f_w = make(WorkloadType.F, inst.f_ticks)
-                b_w = make(WorkloadType.B, b_ticks)
-                w_w = make(WorkloadType.W, w_ticks) if w_ticks > 0 else None
+                # Variable batches scale aux blocks with the microbatch's
+                # token count (linear): the module runs as one opaque block,
+                # so no per-op attention split applies (that quadratic term
+                # only exists inside the backbone's stage timings).
+                lin = self.plan.token_ratio_for_mid(mid)
+                f_w = make(WorkloadType.F, inst.f_ticks * lin)
+                b_w = make(WorkloadType.B, b_ticks * lin)
+                w_w = make(WorkloadType.W, w_ticks * lin) if w_ticks > 0 else None
                 f_done = WorkloadConstraint(inst.device_id, mid, inst.aux_sid, WorkloadType.F)
                 b_done = WorkloadConstraint(inst.device_id, mid, inst.aux_sid, WorkloadType.B)
 
