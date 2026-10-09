@@ -128,10 +128,14 @@ class PipelineRuntime:
 
     def _init_devices(self) -> None:
         placement = self.plan.placement.device_stages
-        # Profiled timings are in 0.01 ms ticks; the empirical overheads below
-        # are given in ms and converted here.
+        # Profiled timings are in 0.01 ms (= 10 us) ticks; the empirical
+        # overheads below are given in ms / us and converted to ticks here.
+        # comm_time delays every cross-device dependency edge; with a whole
+        # simulation tick clock any fractional arrival rounds up, so e.g. the
+        # default 5 us alpha shows up as one full tick between an F's end and
+        # the next stage's F start.  Set both to 0 for back-to-back edges.
         overhead = self.hardware.workload_overhead_ms * 100.0
-        comm_time = self.hardware.comm_alpha_us / 1000.0 + self.hardware.p2p_latency_ms * 100.0
+        comm_time = self.hardware.comm_alpha_us / 10.0 + self.hardware.p2p_latency_ms * 100.0
         self._comm_time = comm_time
         self._workload_overhead = overhead
         for did in range(self.device_num):
